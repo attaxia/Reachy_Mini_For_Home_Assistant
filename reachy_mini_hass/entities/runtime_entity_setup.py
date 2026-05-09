@@ -124,6 +124,31 @@ def setup_runtime_entities(registry: "EntityRegistry", entities: list) -> None:
         )
     )
 
+    # Deep Sleep is the user-facing inverse of idle_behavior_enabled. When
+    # ON, the head is lowered into the deep sleep rest pose (camera
+    # occluded). When OFF, the head is raised into the active idle pose
+    # with breathing animation. Both this switch and "Idle Behavior" are
+    # backed by the same preference, so toggling one updates the other.
+    def get_deep_sleep() -> bool:
+        prefs = registry._get_preferences()
+        return not bool(prefs.idle_behavior_enabled) if prefs is not None else True
+
+    def set_deep_sleep(enabled: bool) -> None:
+        registry._set_idle_behavior_enabled(not enabled)
+
+    entities.append(
+        SwitchEntity(
+            server=registry.server,
+            key=get_entity_key("deep_sleep_mode"),
+            name="Deep Sleep",
+            object_id="deep_sleep_mode",
+            icon="mdi:bed",
+            entity_category=1,
+            value_getter=get_deep_sleep,
+            value_setter=set_deep_sleep,
+        )
+    )
+
     def sync_sendspin() -> None:
         registry.server._voice_assistant_service.set_sendspin_enabled(registry._get_pref_bool("sendspin_enabled"))
 

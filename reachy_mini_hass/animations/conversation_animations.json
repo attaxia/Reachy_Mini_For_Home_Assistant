@@ -43,15 +43,15 @@
                                      }
                    },
     "idle_rest_pose":  {
-                            "description":  "Neutral resting pose. Previously set to a deep low-energy pose (pitch 24.39 deg + Z -0.044 m + antennas ~+/-pi) which put the Stewart platform near the edge of its reachable workspace; the daemon's IK solver then rejected emotion poses with 'Collision detected or head pose not achievable!' on every frame, freezing head and body motors while antennas (separate channel, no IK) kept tracking the emotion deltas and looked aggressively over-driven. Keeping rest at neutral ensures emotions can always play from a safe baseline.",
-                            "pitch_deg":  0.0,
+                            "description":  "Deep sleep pose. Pitches the head down and folds antennas back so the camera is occluded, signaling 'asleep'. This pose sits at the edge of the Stewart platform's reachable workspace, so the daemon's IK rejects most emotion poses if you transition directly from here. queue_emotion_move() handles this by lifting the head to neutral via a 0.6s PendingAction first; the action's completion callback then queues the actual emotion. After the emotion ends (and after wake-word listening returns to IDLE), transition_or_apply_idle_rest_pose() smoothly returns the head to this pose.",
+                            "pitch_deg":  24.39,
                             "yaw_deg":  0.0,
                             "roll_deg":  0.0,
-                            "x_m":  0.0,
-                            "y_m":  0.0,
-                            "z_m":  0.0,
-                            "antenna_left_rad":  0.0,
-                            "antenna_right_rad":  0.0
+                            "x_m":  -0.021,
+                            "y_m":  0.001,
+                            "z_m":  -0.044,
+                            "antenna_left_rad":  3.05,
+                            "antenna_right_rad":  -3.05
                         },
     "emotions":  {
                      "happy":  {

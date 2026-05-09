@@ -452,12 +452,40 @@ class MovementManager:
         emotion poses in the control loop, which avoids conflicts with
         set_target() calls that would cause "a move is currently running" warnings.
 
+        If the robot is currently parked at the deep sleep rest pose
+        (idle_behavior disabled and state == IDLE), this method first
+        smoothly lifts the head to neutral over 0.6s via a PendingAction,
+        and uses the action's completion callback to queue the actual
+        emotion. The lift is required because the deep sleep pose sits at
+        the edge of the Stewart platform's reachable workspace; the
+        daemon's IK rejects emotion poses if we try to transition directly
+        from there ("Collision detected or head pose not achievable!").
+
         Args:
             emotion_name: Name of the emotion (e.g., "happy1", "sad1")
 
         Returns:
             True if emotion was queued successfully, False otherwise
         """
+        if self.state.robot_state == RobotState.IDLE and not self._idle_behavior_enabled():
+            def _emotion_after_lift() -> None:
+                self._enqueue_command("emotion_move", emotion_name, "emotion_after_lift")
+
+            lift_action = PendingAction(
+                name="lift_for_emotion",
+                target_pitch=0.0,
+                target_yaw=0.0,
+                target_roll=0.0,
+                target_x=0.0,
+                target_y=0.0,
+                target_z=0.0,
+                target_antenna_left=0.0,
+                target_antenna_right=0.0,
+                duration=0.6,
+                callback=_emotion_after_lift,
+            )
+            return self._enqueue_command("action", lift_action, "lift_for_emotion")
+
         return self._enqueue_command("emotion_move", emotion_name, "emotion_move")
 
     def queue_action(self, action: PendingAction) -> None:

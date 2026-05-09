@@ -52,6 +52,7 @@ def update_emotion_move(manager: "MovementManager") -> tuple[np.ndarray, tuple[f
             emotion_name = manager._emotion_move.emotion_name
             manager._emotion_move = None
             logger.info("Emotion move complete: %s", emotion_name)
+            _return_to_rest_if_deep_sleep(manager)
             return None
         try:
             head_pose, antennas, body_yaw = manager._emotion_move.evaluate(elapsed)
@@ -61,7 +62,26 @@ def update_emotion_move(manager: "MovementManager") -> tuple[np.ndarray, tuple[f
         except Exception as e:
             logger.error("Error sampling emotion pose: %s", e)
             manager._emotion_move = None
+            _return_to_rest_if_deep_sleep(manager)
             return None
+
+
+def _return_to_rest_if_deep_sleep(manager: "MovementManager") -> None:
+    """Smoothly transition back into the deep sleep rest pose if the user
+    has the deep sleep mode active (idle_behavior disabled) and the robot
+    is now in IDLE state. Called at the end of an emotion and on
+    voice-phase return to IDLE so the head settles back to its resting
+    position. No-op if the user has chosen the raised idle mode.
+    """
+    if manager.state.robot_state != RobotState.IDLE:
+        return
+    if manager._idle_behavior_enabled():
+        return
+    # Lazy import avoids a circular dependency between control_runtime
+    # and idle_runtime at module load.
+    from .idle_runtime import transition_or_apply_idle_rest_pose
+
+    transition_or_apply_idle_rest_pose(manager, duration=2.0)
 
 
 def compose_final_pose(manager: "MovementManager") -> tuple[np.ndarray, tuple[float, float], float]:

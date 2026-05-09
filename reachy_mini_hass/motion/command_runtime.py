@@ -55,6 +55,13 @@ def handle_command(manager: "MovementManager", cmd: str, payload: Any) -> None:
             manager._start_antenna_unfreeze()
             manager._idle_antenna_smoothed = None
             manager._last_idle_antenna_update = 0.0
+            # When listening/thinking/speaking ends and we're back in IDLE
+            # under deep sleep mode, smoothly lower the head back into the
+            # configured rest pose so the camera is occluded again.
+            if not manager._idle_behavior_enabled():
+                from .idle_runtime import transition_or_apply_idle_rest_pose
+
+                transition_or_apply_idle_rest_pose(manager, duration=2.0)
 
         if payload != RobotState.IDLE:
             # Preserve the current pose anchor during an active conversation.
