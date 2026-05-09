@@ -243,13 +243,16 @@ class MovementManager:
         self._smoothed_face_offsets: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         # self._face_smoothing_factor = 0.3  # DISABLED - direct application instead
 
-        # Emotion move playback state. The SDK's `reachy.play_move(...)` is
-        # blocking and runs its own 100Hz loop, so we drive it from a dedicated
-        # daemon thread. While that thread is alive, `_emotion_playing_event`
-        # is set, which suppresses competing `set_target()` calls from the
-        # control loop (see `issue_control_command`).
+        # Emotion move playback state. We run the playback ourselves on a
+        # dedicated thread (sync, not via SDK play_move which uses asgiref's
+        # async_to_sync — that path was leaving the event-clear `finally`
+        # unreachable in some cases, freezing all robot motion).
+        # `_emotion_playing_event` gates `issue_control_command` while a
+        # playback is in flight; `_emotion_cancelled` is the worker's
+        # cooperative cancel signal.
         self._emotion_thread: threading.Thread | None = None
         self._emotion_thread_lock = threading.Lock()
+        self._emotion_cancelled = threading.Event()
 
         # DOA (Direction of Arrival) sound tracking
         self._doa_tracker = DOATracker(
@@ -366,21 +369,34 @@ class MovementManager:
             logger.info("MovementManager resumed - robot reconnected")
 
     def _cancel_active_emotion(self, *, join_timeout: float = 1.0) -> None:
-        """Cancel any in-progress emotion playback (motion + bundled audio).
+        """Cancel any in-progress emotion playback.
 
-        Calls `reachy.cancel_move()` so the SDK's playback loop exits at its
-        next iteration, then waits briefly for the playback thread to finish.
-        Safe to call when no emotion is playing.
+        Sets `_emotion_cancelled` and waits briefly for the playback thread
+        to exit. We deliberately do NOT call SDK `reachy.cancel_move()` here:
+        that helper calls `media_manager.stop_playing()` as a side effect,
+        which tears down the same audio pipeline `voice_assistant.py` uses
+        for TTS — calling it would silently break voice-assist audio for
+        the rest of the session.
+
+        If the worker still hasn't exited after `join_timeout`, the event
+        is force-cleared so the MovementManager control loop is not left
+        frozen by the gate in `issue_control_command`.
+
+        The bundled emotion `.wav` (if any) plays out naturally; cancelling
+        only stops further pose commands.
         """
         if not self._emotion_playing_event.is_set():
             return
-        try:
-            self.robot.cancel_move()
-        except Exception:
-            logger.debug("cancel_move() failed", exc_info=True)
+        self._emotion_cancelled.set()
         thread = self._emotion_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=join_timeout)
+            if thread.is_alive():
+                logger.warning(
+                    "Emotion thread did not exit within %.1fs; force-clearing playing event",
+                    join_timeout,
+                )
+                self._emotion_playing_event.clear()
 
     def suspend(self) -> None:
         """Suspend the movement manager runtime resources.
@@ -450,24 +466,26 @@ class MovementManager:
         logger.info("MovementManager resumed")
 
     def queue_emotion_move(self, emotion_name: str) -> bool:
-        """Thread-safe: Play an emotion using the SDK's native `play_move()`.
+        """Thread-safe: Play an emotion (motion + bundled audio) on a worker thread.
 
-        Delegates the full playback to `reachy.play_move(move, initial_goto_duration=0.4, sound=True)`,
-        which:
-          - smoothly blends from the current pose to the emotion's first frame,
-          - plays the bundled `.wav` audio in sync with the motion,
-          - drives the motors via the daemon at the SDK's playback frequency.
+        Smoothly blends from the current pose to the emotion's first frame
+        via the SDK's `goto_target`, plays the move's bundled `.wav` via
+        `media.play_sound`, then streams the trajectory at 100Hz using
+        `reachy.set_target(...)` — the same call the rest of MovementManager
+        uses, so the daemon stays in one consistent command mode.
 
-        The MovementManager's own `set_target()` calls are suppressed for the
-        duration via `_emotion_playing_event` (see `issue_control_command`),
-        so the regular control loop does not fight the emotion playback.
+        While the worker is alive `_emotion_playing_event` is set, which
+        gates off `issue_control_command` so the control loop does not
+        send competing pose commands. The event is *guaranteed* to be
+        cleared in the worker's `finally` block; if the worker somehow
+        fails to exit, the next call here force-clears it as a safety net.
 
         Args:
             emotion_name: Name of the emotion (e.g., "happy1", "sad1").
 
         Returns:
-            True if emotion playback was scheduled, False if the emotion
-            library is unavailable or the move failed to load.
+            True if playback was scheduled, False if the emotion library
+            is unavailable or the move failed to load.
         """
         if not is_emotion_available():
             logger.warning("Cannot play emotion '%s': library not available", emotion_name)
@@ -480,17 +498,24 @@ class MovementManager:
             return False
 
         with self._emotion_thread_lock:
-            # Cancel any in-progress emotion before starting a new one.
-            # cancel_move() also stops the bundled audio.
-            if self._emotion_playing_event.is_set():
-                try:
-                    self.robot.cancel_move()
-                except Exception:
-                    logger.debug("cancel_move() failed", exc_info=True)
-                existing = self._emotion_thread
-                if existing is not None and existing.is_alive():
-                    existing.join(timeout=1.0)
+            existing = self._emotion_thread
+            if existing is not None and existing.is_alive():
+                # Cooperative cancel via our own event (no SDK cancel_move,
+                # which would stop_playing() the TTS pipeline as a side effect).
+                self._emotion_cancelled.set()
+                existing.join(timeout=1.5)
+                if existing.is_alive():
+                    logger.warning(
+                        "Previous emotion thread still alive after 1.5s; "
+                        "force-clearing playing event so the control loop is not frozen"
+                    )
+                    self._emotion_playing_event.clear()
+            elif self._emotion_playing_event.is_set():
+                # Stale event without a live thread — recover.
+                logger.warning("Stale _emotion_playing_event with no live worker; clearing")
+                self._emotion_playing_event.clear()
 
+            self._emotion_cancelled.clear()
             self._emotion_playing_event.set()
             thread = threading.Thread(
                 target=self._emotion_playback_worker,
@@ -503,25 +528,92 @@ class MovementManager:
         return True
 
     def _emotion_playback_worker(self, emotion_name: str, recorded_move) -> None:
-        """Run `reachy.play_move()` on this dedicated thread.
+        """Drive emotion playback synchronously from this dedicated thread.
 
-        play_move() is synchronous and blocks until the move finishes, so it
-        must not run on the control-loop thread. While it runs, the control
-        loop's pose sends are gated off by `_emotion_playing_event`.
+        Functionally equivalent to `reachy.play_move(move, initial_goto_duration=0.4,
+        sound=True)`, but does not go through `asgiref.async_to_sync`. We hit
+        a freeze where async_to_sync's teardown didn't return, so the worker's
+        `finally: _emotion_playing_event.clear()` never ran and the gate in
+        `issue_control_command` left the entire MovementManager unable to
+        send pose commands. Driving the loop ourselves removes that
+        failure mode and makes the event-clear path bulletproof.
         """
+        cancelled = False
         try:
             has_audio = recorded_move.sound_path is not None
             logger.info(
-                "Playing emotion '%s' (duration=%.2fs, audio=%s)",
+                "Emotion '%s': starting (duration=%.2fs, audio=%s)",
                 emotion_name,
                 recorded_move.duration,
                 "yes" if has_audio else "no",
             )
-            self.robot.play_move(recorded_move, initial_goto_duration=0.4, sound=True)
-            logger.info("Emotion '%s' complete", emotion_name)
-        except Exception as e:
-            logger.error("Emotion '%s' playback failed: %s", emotion_name, e)
+
+            # 1. Smooth blend-in from current pose to the emotion's first frame.
+            try:
+                head0, antennas0, body_yaw0 = recorded_move.evaluate(0.0)
+                self.robot.goto_target(
+                    head=head0,
+                    antennas=antennas0,
+                    duration=0.4,
+                    body_yaw=body_yaw0,
+                )
+            except Exception:
+                logger.exception("Emotion '%s': initial blend failed; continuing to streaming", emotion_name)
+
+            if self._emotion_cancelled.is_set():
+                cancelled = True
+                return
+
+            # 2. Kick off the bundled audio. Non-blocking — GStreamer queues it.
+            if has_audio:
+                try:
+                    self.robot.media.play_sound(str(recorded_move.sound_path))
+                except Exception:
+                    logger.exception("Emotion '%s': play_sound failed", emotion_name)
+
+            # 3. Stream the trajectory at 100Hz. Use set_target() (combined),
+            #    matching the rest of MovementManager so the daemon stays in
+            #    a single, consistent command mode.
+            play_period = 1.0 / 100.0
+            t0 = time.monotonic()
+            duration = float(recorded_move.duration)
+            while True:
+                if self._emotion_cancelled.is_set():
+                    cancelled = True
+                    break
+                now = time.monotonic()
+                elapsed = now - t0
+                if elapsed >= duration:
+                    break
+                t = min(elapsed, duration - 1e-2)
+                try:
+                    head, antennas, body_yaw = recorded_move.evaluate(t)
+                    self.robot.set_target(
+                        head=head,
+                        antennas=list(antennas) if antennas is not None else None,
+                        body_yaw=float(body_yaw) if body_yaw is not None else None,
+                    )
+                except Exception:
+                    logger.exception("Emotion '%s': frame error at t=%.2fs; aborting", emotion_name, t)
+                    break
+
+                # Sleep until next 100Hz tick; wake early if cancelled.
+                sleep_time = play_period - (time.monotonic() - now)
+                if sleep_time > 0 and self._emotion_cancelled.wait(timeout=sleep_time):
+                    cancelled = True
+                    break
+
+            if cancelled:
+                logger.info("Emotion '%s': cancelled", emotion_name)
+            else:
+                logger.info("Emotion '%s': complete", emotion_name)
+        except Exception:
+            logger.exception("Emotion '%s': worker crashed", emotion_name)
         finally:
+            # CRITICAL: always clear the gate so MovementManager's control loop
+            # can resume sending pose commands. Without this, every form of
+            # robot motion (idle behavior, voice-assist head pose, future
+            # emotions) stays frozen for the rest of the session.
             self._emotion_playing_event.clear()
 
     def queue_action(self, action: PendingAction) -> None:
