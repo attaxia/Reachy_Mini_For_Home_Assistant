@@ -43,27 +43,6 @@ def update_face_tracking(manager: "MovementManager", face_detected_threshold: fl
         logger.debug("Error getting face tracking offsets: %s", e)
 
 
-def update_emotion_move(manager: "MovementManager") -> tuple[np.ndarray, tuple[float, float], float] | None:
-    with manager._emotion_move_lock:
-        if manager._emotion_move is None:
-            return None
-        elapsed = manager._now() - manager._emotion_start_time
-        if elapsed >= manager._emotion_move.duration:
-            emotion_name = manager._emotion_move.emotion_name
-            manager._emotion_move = None
-            logger.info("Emotion move complete: %s", emotion_name)
-            return None
-        try:
-            head_pose, antennas, body_yaw = manager._emotion_move.evaluate(elapsed)
-            antenna_tuple = (float(antennas[0]), float(antennas[1]))
-            clamped_body_yaw = clamp_body_yaw(float(body_yaw))
-            return (head_pose, antenna_tuple, clamped_body_yaw)
-        except Exception as e:
-            logger.error("Error sampling emotion pose: %s", e)
-            manager._emotion_move = None
-            return None
-
-
 def compose_final_pose(manager: "MovementManager") -> tuple[np.ndarray, tuple[float, float], float]:
     primary_head = create_head_pose_matrix(
         x=manager.state.target_x,
@@ -181,19 +160,17 @@ def run_control_loop(manager: "MovementManager", *, max_control_dt_s: float, fac
             if manager._robot_paused_event.is_set():
                 manager._robot_resumed_event.wait(timeout=0.5)
                 continue
-            emotion_pose = manager._update_emotion_move()
-            if emotion_pose is not None:
-                head_pose, antennas, body_yaw = emotion_pose
-                manager._issue_control_command(head_pose, antennas, body_yaw)
-            else:
-                manager._update_action(dt)
-                manager._update_animation(dt)
-                manager._update_antenna_blend(dt)
-                manager._update_face_tracking()
-                manager._update_animation_blend()
-                manager._update_idle_look_around()
-                head_pose, antennas, body_yaw = manager._compose_final_pose()
-                manager._issue_control_command(head_pose, antennas, body_yaw)
+            manager._update_action(dt)
+            manager._update_animation(dt)
+            manager._update_antenna_blend(dt)
+            manager._update_face_tracking()
+            manager._update_animation_blend()
+            manager._update_idle_look_around()
+            head_pose, antennas, body_yaw = manager._compose_final_pose()
+            # When an emotion is being played by the dedicated playback thread,
+            # `_emotion_playing_event` is set and `issue_control_command` will
+            # short-circuit instead of sending competing `set_target()` calls.
+            manager._issue_control_command(head_pose, antennas, body_yaw)
         except Exception as e:
             manager._log_error_throttled(f"Control loop error: {e}")
         sleep_time = max(0.0, manager._target_period - (manager._now() - loop_start))

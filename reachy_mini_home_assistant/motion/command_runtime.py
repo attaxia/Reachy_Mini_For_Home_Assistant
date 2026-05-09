@@ -7,7 +7,6 @@ import math
 from queue import Empty
 from typing import TYPE_CHECKING, Any
 
-from .emotion_moves import EmotionMove, is_emotion_available
 from .state_machine import STATE_ANIMATION_MAP, PendingAction, RobotState
 
 if TYPE_CHECKING:
@@ -121,27 +120,8 @@ def handle_command(manager: "MovementManager", cmd: str, payload: Any) -> None:
         manager.state.sway_yaw = yaw
         return
 
-    if cmd == "emotion_move":
-        start_emotion_move(manager, payload)
-        return
-
     if cmd == "set_idle_behavior":
         manager._apply_idle_behavior_enabled(bool(payload))
-
-
-def start_emotion_move(manager: "MovementManager", emotion_name: str) -> None:
-    if not is_emotion_available():
-        logger.warning("Cannot play emotion '%s': emotion library not available", emotion_name)
-        return
-
-    try:
-        emotion_move = EmotionMove(emotion_name)
-        with manager._emotion_move_lock:
-            manager._emotion_move = emotion_move
-            manager._emotion_start_time = manager._now()
-        logger.info("Started emotion move: %s (duration=%.2fs)", emotion_name, emotion_move.duration)
-    except Exception as e:
-        logger.error("Failed to start emotion '%s': %s", emotion_name, e)
 
 
 def start_action(manager: "MovementManager", action: PendingAction) -> None:
