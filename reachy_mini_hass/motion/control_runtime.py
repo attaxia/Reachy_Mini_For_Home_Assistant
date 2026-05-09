@@ -135,6 +135,21 @@ def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, ant
             manager._connection_lost = False
             manager._reconnect_attempt_interval = manager._reconnect_backoff_initial
             manager._suppressed_errors = 0
+            # During the WS gap (typically ~2s), the daemon's per-motor
+            # watchdog can drop torque on individual motors — antennas in
+            # particular, since they hold position with continuous correction.
+            # `set_target` alone won't move a torque-off motor; we have to
+            # re-energize them explicitly. enable_motors() is idempotent on
+            # already-enabled motors, so this is safe to call unconditionally.
+            # (Trade-off: if the user explicitly disabled motors via HA right
+            # before a reconnect, this would re-enable against their intent.
+            # That window is narrow and recoverable; missing the recovery for
+            # all other users is the worse default.)
+            try:
+                manager.robot.enable_motors()
+                logger.info("Re-enabled motors after reconnect")
+            except Exception:
+                logger.exception("Failed to enable motors after reconnect")
     except Exception as e:
         error_msg = str(e)
         manager._consecutive_errors += 1
