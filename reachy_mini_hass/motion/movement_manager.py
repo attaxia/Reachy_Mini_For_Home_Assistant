@@ -530,13 +530,26 @@ class MovementManager:
     def _emotion_playback_worker(self, emotion_name: str, recorded_move) -> None:
         """Drive emotion playback synchronously from this dedicated thread.
 
-        Functionally equivalent to `reachy.play_move(move, initial_goto_duration=0.4,
-        sound=True)`, but does not go through `asgiref.async_to_sync`. We hit
-        a freeze where async_to_sync's teardown didn't return, so the worker's
-        `finally: _emotion_playing_event.clear()` never ran and the gate in
-        `issue_control_command` left the entire MovementManager unable to
-        send pose commands. Driving the loop ourselves removes that
-        failure mode and makes the event-clear path bulletproof.
+        Drives RecordedMove playback by streaming `set_target(...)` at
+        `Config.motion.max_send_rate_hz` and triggering `media.play_sound`
+        for the bundled audio.
+
+        Two intentional differences from the SDK's `reachy.play_move(...)`:
+
+        1. We do NOT route through `asgiref.async_to_sync`. An earlier
+           version that called `play_move()` could leave async_to_sync's
+           event-loop teardown stalled, so the worker's
+           `finally: _emotion_playing_event.clear()` never ran and the
+           gate in `issue_control_command` froze the entire
+           MovementManager. Sync code we control makes the event-clear
+           path bulletproof.
+
+        2. We do NOT call `goto_target` for an initial blend-in. That
+           opens the daemon's task system (separate command pathway from
+           set_target streaming). Mixing the two left the daemon's motor
+           state inconsistent across emotions — head/body motors silently
+           dropped on emotion N+1 while antennas kept responding. Sticking
+           to set_target throughout keeps one consistent command mode.
         """
         cancelled = False
         try:
@@ -548,36 +561,38 @@ class MovementManager:
                 "yes" if has_audio else "no",
             )
 
-            # 1. Smooth blend-in from current pose to the emotion's first frame.
-            try:
-                head0, antennas0, body_yaw0 = recorded_move.evaluate(0.0)
-                self.robot.goto_target(
-                    head=head0,
-                    antennas=antennas0,
-                    duration=0.4,
-                    body_yaw=body_yaw0,
-                )
-            except Exception:
-                logger.exception("Emotion '%s': initial blend failed; continuing to streaming", emotion_name)
+            # No goto_target blend-in. goto_target uses the daemon's task
+            # system (send_task_request / wait_for_task_completion) which is
+            # a different command pathway from the streaming set_target we
+            # use below. Mixing the two left the daemon in an inconsistent
+            # state across emotions: the first emotion played fully, but on
+            # emotion #2+ the head/body motors silently stopped responding
+            # while the antennas (which sit on a separate controller channel)
+            # kept getting commands and looked "more aggressive" because they
+            # were the only motors still moving. Streaming-only keeps the
+            # daemon in one command mode the whole way through.
+            #
+            # The first frame is delivered as a plain set_target below; the
+            # motor controllers' velocity limits absorb the transition.
 
             if self._emotion_cancelled.is_set():
                 cancelled = True
                 return
 
-            # 2. Kick off the bundled audio. Non-blocking — GStreamer queues it.
+            # Kick off the bundled audio. Non-blocking — GStreamer queues it.
             if has_audio:
                 try:
                     self.robot.media.play_sound(str(recorded_move.sound_path))
                 except Exception:
                     logger.exception("Emotion '%s': play_sound failed", emotion_name)
 
-            # 3. Stream the trajectory using set_target() (combined), matching
-            #    the rest of MovementManager so the daemon stays in a single,
-            #    consistent command mode. We use the same `max_send_rate_hz`
-            #    cap as the regular control loop — sending much faster than
-            #    that drowned the daemon's WS heartbeat under combined audio
-            #    + 100Hz traffic, eventually killing the connection for the
-            #    rest of the session.
+            # Stream the trajectory using set_target() (combined), matching
+            # the rest of MovementManager so the daemon stays in a single,
+            # consistent command mode. We use the same `max_send_rate_hz`
+            # cap as the regular control loop — sending much faster than
+            # that drowned the daemon's WS heartbeat under combined audio
+            # + 100Hz traffic, eventually killing the connection for the
+            # rest of the session.
             play_period = 1.0 / max(1.0, float(Config.motion.max_send_rate_hz))
             t0 = time.monotonic()
             duration = float(recorded_move.duration)
