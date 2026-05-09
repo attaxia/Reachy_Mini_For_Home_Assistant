@@ -6,9 +6,9 @@ import unittest
 from pathlib import Path
 
 
-_MODULE_PATH = Path("reachy_mini_home_assistant/entities/emotion_detector.py")
+_MODULE_PATH = Path("reachy_mini_hass/entities/emotion_detector.py")
 _SPEC = importlib.util.spec_from_file_location(
-    "reachy_mini_home_assistant.entities.emotion_detector",
+    "reachy_mini_hass.entities.emotion_detector",
     _MODULE_PATH,
 )
 _MODULE = importlib.util.module_from_spec(_SPEC)

@@ -2,7 +2,7 @@ import threading
 import unittest
 from types import SimpleNamespace
 
-from reachy_mini_home_assistant.vision.camera_processing import process_gesture_detection
+from reachy_mini_hass.vision.camera_processing import process_gesture_detection
 
 
 class _FakeGestureValue:

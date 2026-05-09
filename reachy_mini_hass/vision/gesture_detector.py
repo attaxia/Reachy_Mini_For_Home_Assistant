@@ -116,7 +116,7 @@ class GestureDetector:
         if not self._detector_path.exists() or not self._classifier_path.exists():
             raise FileNotFoundError(
                 "Gesture model files are missing in vision/models. "
-                "Please reinstall reachy_mini_home_assistant and ensure "
+                "Please reinstall reachy_mini_hass and ensure "
                 "hand_detector.onnx and crops_classifier.onnx are present."
             )
         self._detector = None

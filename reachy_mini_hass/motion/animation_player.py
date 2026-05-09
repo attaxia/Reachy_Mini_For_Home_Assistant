@@ -21,7 +21,7 @@ from ..animations.animation_config import load_animation_config
 _LOGGER = logging.getLogger(__name__)
 
 _MODULE_DIR = Path(__file__).parent
-_PACKAGE_DIR = _MODULE_DIR.parent  # reachy_mini_home_assistant/
+_PACKAGE_DIR = _MODULE_DIR.parent  # reachy_mini_hass/
 _ANIMATIONS_FILE = _PACKAGE_DIR / "animations" / "conversation_animations.json"
 
 

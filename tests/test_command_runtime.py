@@ -3,12 +3,12 @@ import types
 import unittest
 from pathlib import Path
 
-from reachy_mini_home_assistant.protocol import voice_pipeline
+from reachy_mini_hass.protocol import voice_pipeline
 
 
 class CommandRuntimeSourceTests(unittest.TestCase):
     def test_non_idle_state_no_longer_resets_pose_anchor(self):
-        path = Path("reachy_mini_home_assistant/motion/command_runtime.py")
+        path = Path("reachy_mini_hass/motion/command_runtime.py")
         content = path.read_text(encoding="utf-8")
 
         match = re.search(r"if payload != RobotState\.IDLE:(?P<body>[\s\S]*?)logger\.debug", content)
@@ -87,7 +87,7 @@ class VoicePipelineStopTests(unittest.TestCase):
 
 class CommandRuntimeStateQueueTests(unittest.TestCase):
     def test_poll_commands_coalesces_back_to_back_state_updates(self):
-        path = Path("reachy_mini_home_assistant/motion/command_runtime.py")
+        path = Path("reachy_mini_hass/motion/command_runtime.py")
         content = path.read_text(encoding="utf-8")
 
         self.assertIn('if cmd == "set_state":', content)
@@ -97,7 +97,7 @@ class CommandRuntimeStateQueueTests(unittest.TestCase):
 
 class IdleRestPoseSourceTests(unittest.TestCase):
     def test_transition_to_idle_rest_uses_full_rest_pose(self):
-        path = Path("reachy_mini_home_assistant/motion/movement_manager.py")
+        path = Path("reachy_mini_hass/motion/movement_manager.py")
         content = path.read_text(encoding="utf-8")
 
         self.assertIn("target_yaw=self._idle_rest_head_yaw_rad", content)
@@ -109,7 +109,7 @@ class IdleRestPoseSourceTests(unittest.TestCase):
 
 class StopWordSourceTests(unittest.TestCase):
     def test_stop_word_uses_runtime_context_not_active_wakeword_membership(self):
-        path = Path("reachy_mini_home_assistant/voice_assistant.py")
+        path = Path("reachy_mini_hass/voice_assistant.py")
         content = path.read_text(encoding="utf-8")
 
         self.assertIn("stop_context_active = (", content)
@@ -121,7 +121,7 @@ class StopWordSourceTests(unittest.TestCase):
         self.assertNotIn("stop_armed = self._state.stop_word.id in self._state.active_wake_words", content)
 
     def test_stop_word_inference_only_runs_in_interruptible_context(self):
-        path = Path("reachy_mini_home_assistant/voice_assistant.py")
+        path = Path("reachy_mini_hass/voice_assistant.py")
         content = path.read_text(encoding="utf-8")
 
         self.assertIn("AUDIO_BLOCK_SIZE = 512", content)

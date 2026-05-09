@@ -120,7 +120,7 @@ class ReachyMiniHaVoice(ReachyMiniApp):
             logger.info("Reachy Mini HA stopped.")
 
 
-# This is called when running as: python -m reachy_mini_home_assistant.main
+# This is called when running as: python -m reachy_mini_hass.main
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,

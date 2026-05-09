@@ -39,7 +39,6 @@
     "deny": [],
     "ask": []
   },
-  "model": "opus",
   "hooks": {},
   "statusLine": {
     "type": "command",

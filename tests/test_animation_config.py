@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 
-_CONFIG_PATH = Path("reachy_mini_home_assistant/animations/animation_config.py")
+_CONFIG_PATH = Path("reachy_mini_hass/animations/animation_config.py")
 _CONFIG_SPEC = importlib.util.spec_from_file_location("test_animation_config_module", _CONFIG_PATH)
 _CONFIG_MODULE = importlib.util.module_from_spec(_CONFIG_SPEC)
 assert _CONFIG_SPEC is not None and _CONFIG_SPEC.loader is not None

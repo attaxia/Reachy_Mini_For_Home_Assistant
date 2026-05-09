@@ -139,7 +139,7 @@ Integrate Home Assistant voice assistant functionality into Reachy Mini Wi-Fi ro
 ### Software Module Architecture (v1.0.6)
 
 ```
-reachy_mini_home_assistant/
+reachy_mini_hass/
 鈹?
 鈹溾攢鈹€ main.py                    # ReachyMiniApp entry point
 鈹溾攢鈹€ __main__.py                # Standalone CLI entry point
