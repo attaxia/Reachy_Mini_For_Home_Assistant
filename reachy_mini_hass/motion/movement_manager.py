@@ -23,6 +23,7 @@ import time
 from collections import deque
 from pathlib import Path
 from queue import Queue
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -248,6 +249,16 @@ class MovementManager:
         self._emotion_move: EmotionMove | None = None
         self._emotion_start_time: float = 0.0
         self._emotion_move_lock = threading.Lock()
+
+        # Deep sleep state tracking + publish callback. The HA "Deep Sleep"
+        # switch wants to reflect the *actual* runtime state of the robot,
+        # not just the configured preference: when an emotion temporarily
+        # lifts the head, the toggle should flip OFF, then back ON when the
+        # head settles back into rest. The control loop watches
+        # `is_in_deep_sleep_state()` for changes and calls this callback so
+        # the entity can push the new state to HA.
+        self._deep_sleep_state_callback: Callable[[], None] | None = None
+        self._last_published_deep_sleep_state: bool | None = None
 
         # DOA (Direction of Arrival) sound tracking
         self._doa_tracker = DOATracker(
@@ -561,6 +572,39 @@ class MovementManager:
         """
         self._camera_server = camera_server
         logger.info("Camera server set for face tracking")
+
+    def is_in_deep_sleep_state(self) -> bool:
+        """True when the robot is currently parked at the deep sleep rest pose.
+
+        Reflects *runtime* state, not just the configured preference:
+
+          - Configured for raised idle (idle_behavior on) → always False.
+          - Robot in LISTENING/THINKING/SPEAKING (voice phase active) → False.
+          - Emotion currently playing → False.
+          - A pending action is moving the head (e.g. lift-for-emotion,
+            idle_rest interpolation, look-around) → False until it settles.
+          - Otherwise (idle, no transitions in flight) → True.
+        """
+        if self._idle_behavior_enabled():
+            return False
+        if self.state.robot_state != RobotState.IDLE:
+            return False
+        if self.is_emotion_playing():
+            return False
+        if self._pending_action is not None:
+            return False
+        return True
+
+    def set_deep_sleep_state_callback(self, callback: Callable[[], None] | None) -> None:
+        """Register a no-arg callback invoked whenever `is_in_deep_sleep_state`
+        flips. The control loop calls this so the HA "Deep Sleep" switch
+        entity can push its new state to Home Assistant in real time.
+
+        Pass `None` to detach.
+        """
+        self._deep_sleep_state_callback = callback
+        # Reset so the next loop iteration unconditionally publishes once.
+        self._last_published_deep_sleep_state = None
 
     # =========================================================================
     # DOA (Direction of Arrival) Sound Tracking API

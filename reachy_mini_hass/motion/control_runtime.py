@@ -214,9 +214,28 @@ def run_control_loop(manager: "MovementManager", *, max_control_dt_s: float, fac
                 manager._update_idle_look_around()
                 head_pose, antennas, body_yaw = manager._compose_final_pose()
                 manager._issue_control_command(head_pose, antennas, body_yaw)
+            _publish_deep_sleep_state_if_changed(manager)
         except Exception as e:
             manager._log_error_throttled(f"Control loop error: {e}")
         sleep_time = max(0.0, manager._target_period - (manager._now() - loop_start))
         if sleep_time > 0:
             time.sleep(sleep_time)
     logger.info("Movement manager control loop stopped")
+
+
+def _publish_deep_sleep_state_if_changed(manager: "MovementManager") -> None:
+    """Detect transitions of `is_in_deep_sleep_state()` and fire the
+    registered publish callback so the HA "Deep Sleep" switch entity can
+    push its new value to Home Assistant. No-op when no callback is
+    registered (i.e., before HA connects)."""
+    callback = manager._deep_sleep_state_callback
+    if callback is None:
+        return
+    current = manager.is_in_deep_sleep_state()
+    if current == manager._last_published_deep_sleep_state:
+        return
+    manager._last_published_deep_sleep_state = current
+    try:
+        callback()
+    except Exception:
+        logger.exception("deep sleep state publish callback failed")
