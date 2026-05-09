@@ -122,6 +122,11 @@ def handle_command(manager: "MovementManager", cmd: str, payload: Any) -> None:
 
     if cmd == "set_idle_behavior":
         manager._apply_idle_behavior_enabled(bool(payload))
+        return
+
+    if cmd == "emotion_move":
+        emotion_name, recorded_move = payload
+        manager._start_emotion_move(emotion_name, recorded_move)
 
 
 def start_action(manager: "MovementManager", action: PendingAction) -> None:

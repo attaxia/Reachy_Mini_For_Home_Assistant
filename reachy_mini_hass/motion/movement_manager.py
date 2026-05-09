@@ -243,15 +243,13 @@ class MovementManager:
         self._smoothed_face_offsets: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         # self._face_smoothing_factor = 0.3  # DISABLED - direct application instead
 
-        # Emotion move playback state. We run the playback ourselves on a
-        # dedicated thread (sync, not via SDK play_move which uses asgiref's
-        # async_to_sync — that path was leaving the event-clear `finally`
-        # unreachable in some cases, freezing all robot motion).
-        # `_emotion_playing_event` gates `issue_control_command` while a
-        # playback is in flight; `_emotion_cancelled` is the worker's
-        # cooperative cancel signal.
-        self._emotion_thread: threading.Thread | None = None
-        self._emotion_thread_lock = threading.Lock()
+        # Emotion move playback state. Emotions are primary moves owned by the
+        # control loop, so `set_target()` is still called from exactly one
+        # thread. This matches the SDK/reference movement architecture and
+        # avoids stale per-motor command channels after repeated emotions.
+        self._active_emotion_name: str | None = None
+        self._active_emotion_move = None
+        self._emotion_start_time: float = 0.0
         self._emotion_cancelled = threading.Event()
 
         # DOA (Direction of Arrival) sound tracking
@@ -371,32 +369,27 @@ class MovementManager:
     def _cancel_active_emotion(self, *, join_timeout: float = 1.0) -> None:
         """Cancel any in-progress emotion playback.
 
-        Sets `_emotion_cancelled` and waits briefly for the playback thread
-        to exit. We deliberately do NOT call SDK `reachy.cancel_move()` here:
+        Sets `_emotion_cancelled` and waits briefly for the control loop
+        to observe it. We deliberately do NOT call SDK `reachy.cancel_move()` here:
         that helper calls `media_manager.stop_playing()` as a side effect,
         which tears down the same audio pipeline `voice_assistant.py` uses
         for TTS — calling it would silently break voice-assist audio for
         the rest of the session.
 
-        If the worker still hasn't exited after `join_timeout`, the event
-        is force-cleared so the MovementManager control loop is not left
-        frozen by the gate in `issue_control_command`.
+        If the control loop has not observed the cancellation after
+        `join_timeout`, the event is force-cleared so shutdown can continue.
 
         The bundled emotion `.wav` (if any) plays out naturally; cancelling
         only stops further pose commands.
         """
-        if not self._emotion_playing_event.is_set():
-            return
         self._emotion_cancelled.set()
-        thread = self._emotion_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=join_timeout)
-            if thread.is_alive():
-                logger.warning(
-                    "Emotion thread did not exit within %.1fs; force-clearing playing event",
-                    join_timeout,
-                )
-                self._emotion_playing_event.clear()
+        if self._emotion_playing_event.is_set() and self._thread is not None and self._thread.is_alive():
+            deadline = self._now() + max(0.0, join_timeout)
+            while self._emotion_playing_event.is_set() and self._now() < deadline:
+                time.sleep(0.01)
+        self._active_emotion_name = None
+        self._active_emotion_move = None
+        self._emotion_playing_event.clear()
 
     def suspend(self) -> None:
         """Suspend the movement manager runtime resources.
@@ -466,19 +459,13 @@ class MovementManager:
         logger.info("MovementManager resumed")
 
     def queue_emotion_move(self, emotion_name: str) -> bool:
-        """Thread-safe: Play an emotion (motion + bundled audio) on a worker thread.
+        """Thread-safe: Play an emotion as a primary move in the control loop.
 
-        Smoothly blends from the current pose to the emotion's first frame
-        via the SDK's `goto_target`, plays the move's bundled `.wav` via
-        `media.play_sound`, then streams the trajectory at 100Hz using
-        `reachy.set_target(...)` — the same call the rest of MovementManager
-        uses, so the daemon stays in one consistent command mode.
-
-        While the worker is alive `_emotion_playing_event` is set, which
-        gates off `issue_control_command` so the control loop does not
-        send competing pose commands. The event is *guaranteed* to be
-        cleared in the worker's `finally` block; if the worker somehow
-        fails to exit, the next call here force-clears it as a safety net.
+        The recorded trajectory is queued into MovementManager and evaluated
+        by the same loop that drives idle, voice phases, and face tracking.
+        That keeps `reachy.set_target(...)` owned by one thread at one steady
+        cadence, matching the SDK/reference movement pattern and avoiding
+        stale motor channels across repeated emotions.
 
         Args:
             emotion_name: Name of the emotion (e.g., "happy1", "sad1").
@@ -497,143 +484,66 @@ class MovementManager:
             logger.error("Failed to load emotion '%s': %s", emotion_name, e)
             return False
 
-        with self._emotion_thread_lock:
-            existing = self._emotion_thread
-            if existing is not None and existing.is_alive():
-                # Cooperative cancel via our own event (no SDK cancel_move,
-                # which would stop_playing() the TTS pipeline as a side effect).
-                self._emotion_cancelled.set()
-                existing.join(timeout=1.5)
-                if existing.is_alive():
-                    logger.warning(
-                        "Previous emotion thread still alive after 1.5s; "
-                        "force-clearing playing event so the control loop is not frozen"
-                    )
-                    self._emotion_playing_event.clear()
-            elif self._emotion_playing_event.is_set():
-                # Stale event without a live thread — recover.
-                logger.warning("Stale _emotion_playing_event with no live worker; clearing")
-                self._emotion_playing_event.clear()
+        return self._enqueue_command("emotion_move", (emotion_name, recorded_move), "emotion")
 
-            self._emotion_cancelled.clear()
-            self._emotion_playing_event.set()
-            thread = threading.Thread(
-                target=self._emotion_playback_worker,
-                args=(emotion_name, recorded_move),
-                daemon=True,
-                name=f"EmotionPlayback-{emotion_name}",
-            )
-            self._emotion_thread = thread
-            thread.start()
-        return True
+    def _start_emotion_move(self, emotion_name: str, recorded_move) -> None:
+        """Start an emotion as the current primary move inside the control loop."""
+        self._emotion_cancelled.clear()
+        self._active_emotion_name = emotion_name
+        self._active_emotion_move = recorded_move
+        self._emotion_start_time = self._now()
+        self._emotion_playing_event.set()
+        self._pending_action = None
+        self._idle_action_queue.clear()
+        self.state.look_around_in_progress = False
+        has_audio = recorded_move.sound_path is not None
+        logger.info(
+            "Emotion '%s': starting (duration=%.2fs, audio=%s)",
+            emotion_name,
+            recorded_move.duration,
+            "yes" if has_audio else "no",
+        )
+        if has_audio:
+            try:
+                self.robot.media.play_sound(str(recorded_move.sound_path))
+            except Exception:
+                logger.exception("Emotion '%s': play_sound failed", emotion_name)
 
-    def _emotion_playback_worker(self, emotion_name: str, recorded_move) -> None:
-        """Drive emotion playback synchronously from this dedicated thread.
+    def _update_emotion_move(self) -> bool:
+        """Evaluate and issue the active emotion frame from the control loop."""
+        recorded_move = self._active_emotion_move
+        emotion_name = self._active_emotion_name
+        if recorded_move is None or emotion_name is None:
+            return False
 
-        Drives RecordedMove playback by streaming `set_target(...)` at
-        `Config.motion.max_send_rate_hz` and triggering `media.play_sound`
-        for the bundled audio.
-
-        Two intentional differences from the SDK's `reachy.play_move(...)`:
-
-        1. We do NOT route through `asgiref.async_to_sync`. An earlier
-           version that called `play_move()` could leave async_to_sync's
-           event-loop teardown stalled, so the worker's
-           `finally: _emotion_playing_event.clear()` never ran and the
-           gate in `issue_control_command` froze the entire
-           MovementManager. Sync code we control makes the event-clear
-           path bulletproof.
-
-        2. We do NOT call `goto_target` for an initial blend-in. That
-           opens the daemon's task system (separate command pathway from
-           set_target streaming). Mixing the two left the daemon's motor
-           state inconsistent across emotions — head/body motors silently
-           dropped on emotion N+1 while antennas kept responding. Sticking
-           to set_target throughout keeps one consistent command mode.
-        """
-        cancelled = False
-        try:
-            has_audio = recorded_move.sound_path is not None
-            logger.info(
-                "Emotion '%s': starting (duration=%.2fs, audio=%s)",
-                emotion_name,
-                recorded_move.duration,
-                "yes" if has_audio else "no",
-            )
-
-            # No goto_target blend-in. goto_target uses the daemon's task
-            # system (send_task_request / wait_for_task_completion) which is
-            # a different command pathway from the streaming set_target we
-            # use below. Mixing the two left the daemon in an inconsistent
-            # state across emotions: the first emotion played fully, but on
-            # emotion #2+ the head/body motors silently stopped responding
-            # while the antennas (which sit on a separate controller channel)
-            # kept getting commands and looked "more aggressive" because they
-            # were the only motors still moving. Streaming-only keeps the
-            # daemon in one command mode the whole way through.
-            #
-            # The first frame is delivered as a plain set_target below; the
-            # motor controllers' velocity limits absorb the transition.
-
+        elapsed = self._now() - self._emotion_start_time
+        duration = float(recorded_move.duration)
+        if self._emotion_cancelled.is_set() or elapsed >= duration:
             if self._emotion_cancelled.is_set():
-                cancelled = True
-                return
-
-            # Kick off the bundled audio. Non-blocking — GStreamer queues it.
-            if has_audio:
-                try:
-                    self.robot.media.play_sound(str(recorded_move.sound_path))
-                except Exception:
-                    logger.exception("Emotion '%s': play_sound failed", emotion_name)
-
-            # Stream the trajectory using set_target() (combined), matching
-            # the rest of MovementManager so the daemon stays in a single,
-            # consistent command mode. We use the same `max_send_rate_hz`
-            # cap as the regular control loop — sending much faster than
-            # that drowned the daemon's WS heartbeat under combined audio
-            # + 100Hz traffic, eventually killing the connection for the
-            # rest of the session.
-            play_period = 1.0 / max(1.0, float(Config.motion.max_send_rate_hz))
-            t0 = time.monotonic()
-            duration = float(recorded_move.duration)
-            while True:
-                if self._emotion_cancelled.is_set():
-                    cancelled = True
-                    break
-                now = time.monotonic()
-                elapsed = now - t0
-                if elapsed >= duration:
-                    break
-                t = min(elapsed, duration - 1e-2)
-                try:
-                    head, antennas, body_yaw = recorded_move.evaluate(t)
-                    self.robot.set_target(
-                        head=head,
-                        antennas=list(antennas) if antennas is not None else None,
-                        body_yaw=float(body_yaw) if body_yaw is not None else None,
-                    )
-                except Exception:
-                    logger.exception("Emotion '%s': frame error at t=%.2fs; aborting", emotion_name, t)
-                    break
-
-                # Sleep until next 100Hz tick; wake early if cancelled.
-                sleep_time = play_period - (time.monotonic() - now)
-                if sleep_time > 0 and self._emotion_cancelled.wait(timeout=sleep_time):
-                    cancelled = True
-                    break
-
-            if cancelled:
                 logger.info("Emotion '%s': cancelled", emotion_name)
             else:
                 logger.info("Emotion '%s': complete", emotion_name)
-        except Exception:
-            logger.exception("Emotion '%s': worker crashed", emotion_name)
-        finally:
-            # CRITICAL: always clear the gate so MovementManager's control loop
-            # can resume sending pose commands. Without this, every form of
-            # robot motion (idle behavior, voice-assist head pose, future
-            # emotions) stays frozen for the rest of the session.
+            self._active_emotion_name = None
+            self._active_emotion_move = None
             self._emotion_playing_event.clear()
+            self._emotion_cancelled.clear()
+            return False
+
+        t = min(elapsed, duration - 1e-2)
+        try:
+            head, antennas, body_yaw = recorded_move.evaluate(t)
+            if head is None:
+                return True
+            antenna_tuple = tuple(float(value) for value in antennas) if antennas is not None else (0.0, 0.0)
+            body_yaw_value = float(body_yaw) if body_yaw is not None else 0.0
+            self._issue_control_command(head, antenna_tuple, body_yaw_value)
+        except Exception:
+            logger.exception("Emotion '%s': frame error at t=%.2fs; aborting", emotion_name, t)
+            self._active_emotion_name = None
+            self._active_emotion_move = None
+            self._emotion_playing_event.clear()
+            self._emotion_cancelled.clear()
+        return True
 
     def queue_action(self, action: PendingAction) -> None:
         """Thread-safe: Queue a motion action."""
@@ -1087,8 +997,8 @@ class MovementManager:
     def is_emotion_playing(self) -> bool:
         """Check if an emotion move is currently playing.
 
-        Backed by `_emotion_playing_event`, which is set while the dedicated
-        playback thread is running `reachy.play_move(...)`.
+        Backed by `_emotion_playing_event`, which is set while the control
+        loop is evaluating a queued recorded emotion move.
         """
         return self._emotion_playing_event.is_set()
 

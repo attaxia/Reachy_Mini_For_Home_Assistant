@@ -102,20 +102,19 @@ def compose_final_pose(manager: "MovementManager") -> tuple[np.ndarray, tuple[fl
 
 
 def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, antennas: tuple[float, float], body_yaw: float) -> None:
-    if manager._draining_event.is_set() or manager._emotion_playing_event.is_set() or manager._robot_paused_event.is_set():
+    if manager._draining_event.is_set() or manager._robot_paused_event.is_set():
         return
     now = manager._now()
 
-    # Cap actual WS sends to Config.motion.max_send_rate_hz (default 15Hz).
-    # The control loop itself runs at 100Hz to keep face tracking and animation
-    # state fresh, but we only need ~15Hz on the daemon WS to drive the motors
-    # smoothly. Sending faster has been observed to silently kill the daemon's
-    # WS heartbeat — after which the SDK's `_is_alive` flips to False and every
-    # subsequent set_target raises "Lost connection" with no automatic recovery,
-    # leaving the head frozen for the rest of the session.
-    min_send_interval = 1.0 / max(1.0, float(Config.motion.max_send_rate_hz))
-    if not manager._connection_lost and (now - manager._last_send_time) < min_send_interval:
-        return
+    # Cap actual WS sends to Config.motion.max_send_rate_hz. The SDK/reference
+    # movement worker drives set_target from one owner loop near 100Hz; keeping
+    # that cadence prevents individual motor channels from going stale between
+    # repeated primary moves and voice phases.
+    max_send_rate_hz = max(1.0, float(Config.motion.max_send_rate_hz))
+    if max_send_rate_hz < manager._control_loop_hz:
+        min_send_interval = 1.0 / max_send_rate_hz
+        if not manager._connection_lost and (now - manager._last_send_time) < min_send_interval:
+            return
 
     if manager._connection_lost:
         if now - manager._last_reconnect_attempt < manager._reconnect_attempt_interval:
@@ -135,9 +134,8 @@ def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, ant
             manager._connection_lost = False
             manager._reconnect_attempt_interval = manager._reconnect_backoff_initial
             manager._suppressed_errors = 0
-            # During the WS gap (typically ~2s), the daemon's per-motor
-            # watchdog can drop torque on individual motors — antennas in
-            # particular, since they hold position with continuous correction.
+            # During the WS gap, the daemon's per-motor watchdog can drop
+            # torque on individual motors.
             # `set_target` alone won't move a torque-off motor; we have to
             # re-energize them explicitly. enable_motors() is idempotent on
             # already-enabled motors, so this is safe to call unconditionally.
@@ -187,6 +185,11 @@ def run_control_loop(manager: "MovementManager", *, max_control_dt_s: float, fac
             if manager._robot_paused_event.is_set():
                 manager._robot_resumed_event.wait(timeout=0.5)
                 continue
+            if manager._update_emotion_move():
+                sleep_time = max(0.0, manager._target_period - (manager._now() - loop_start))
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                continue
             manager._update_action(dt)
             manager._update_animation(dt)
             manager._update_antenna_blend(dt)
@@ -194,9 +197,6 @@ def run_control_loop(manager: "MovementManager", *, max_control_dt_s: float, fac
             manager._update_animation_blend()
             manager._update_idle_look_around()
             head_pose, antennas, body_yaw = manager._compose_final_pose()
-            # When an emotion is being played by the dedicated playback thread,
-            # `_emotion_playing_event` is set and `issue_control_command` will
-            # short-circuit instead of sending competing `set_target()` calls.
             manager._issue_control_command(head_pose, antennas, body_yaw)
         except Exception as e:
             manager._log_error_throttled(f"Control loop error: {e}")
