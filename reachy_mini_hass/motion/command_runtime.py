@@ -83,6 +83,11 @@ def handle_command(manager: "MovementManager", cmd: str, payload: Any) -> None:
             # Leaving IDLE means we are no longer at deep sleep — clear the
             # latch so the HA Deep Sleep toggle reflects this.
             manager._at_deep_sleep_pose = False
+            # Voice phases (LISTENING/THINKING/SPEAKING) and face tracking
+            # need body yaw coupled to head yaw. Release any persistent
+            # user-commanded body yaw override so the auto-derivation
+            # takes over for the duration of the active session.
+            manager._user_body_yaw_override = None
 
         logger.debug("State changed: %s -> %s, animation: %s", old_state.value, payload.value, animation_name)
         return
