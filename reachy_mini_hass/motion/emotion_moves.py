@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy emotion library initialization to avoid blocking app import/startup.
 try:
-    from reachy_mini.motion.recorded_move import RecordedMove, RecordedMoves
+    from reachy_mini.motion.recorded_move import RecordedMoves
     from reachy_mini.utils import create_head_pose
 
     RECORDED_MOVES: RecordedMoves | None = None
@@ -29,7 +29,6 @@ try:
     _EMOTION_INIT_ATTEMPTED = False
 except Exception as e:
     logger.warning("Emotion library not available: %s", e)
-    RecordedMove = None  # type: ignore[assignment,misc]
     RECORDED_MOVES = None
     EMOTION_AVAILABLE = False
     _EMOTION_INIT_ATTEMPTED = True
@@ -72,17 +71,6 @@ def list_available_emotions() -> list[str]:
     except Exception as e:
         logger.error(f"Error listing emotions: {e}")
         return []
-
-
-def get_recorded_move(emotion_name: str) -> "RecordedMove":
-    """Return the SDK RecordedMove (with `sound_path` and `evaluate`) for native playback.
-
-    The returned object can be passed directly to `reachy.play_move(...)` so the
-    SDK handles the smooth `goto_target` blend-in and the bundled `.wav` audio.
-    """
-    if not _ensure_emotion_library_loaded() or RECORDED_MOVES is None:
-        raise RuntimeError("Emotion library not available")
-    return RECORDED_MOVES.get(emotion_name)
 
 
 class EmotionMove:

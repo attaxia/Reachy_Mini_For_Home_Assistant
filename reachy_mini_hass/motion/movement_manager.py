@@ -36,9 +36,10 @@ from .control_runtime import (
     compose_final_pose,
     issue_control_command,
     run_control_loop,
+    update_emotion_move,
     update_face_tracking,
 )
-from .emotion_moves import get_recorded_move, is_emotion_available
+from .emotion_moves import EmotionMove, is_emotion_available
 from .idle_runtime import (
     apply_idle_behavior_enabled,
     apply_idle_rest_pose,
@@ -243,14 +244,10 @@ class MovementManager:
         self._smoothed_face_offsets: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         # self._face_smoothing_factor = 0.3  # DISABLED - direct application instead
 
-        # Emotion move playback state. Emotions are primary moves owned by the
-        # control loop, so `set_target()` is still called from exactly one
-        # thread. This matches the SDK/reference movement architecture and
-        # avoids stale per-motor command channels after repeated emotions.
-        self._active_emotion_name: str | None = None
-        self._active_emotion_move = None
+        # Emotion move playback state
+        self._emotion_move: EmotionMove | None = None
         self._emotion_start_time: float = 0.0
-        self._emotion_cancelled = threading.Event()
+        self._emotion_move_lock = threading.Lock()
 
         # DOA (Direction of Arrival) sound tracking
         self._doa_tracker = DOATracker(
@@ -340,6 +337,23 @@ class MovementManager:
         """Thread-safe: Return to idle state."""
         self._enqueue_command("set_state", RobotState.IDLE, "set_idle", timeout=0)
 
+    def pause_for_emotion(self) -> None:
+        """Thread-safe: Pause control loop while emotion animation is playing.
+
+        DEPRECATED: Use queue_emotion_move() instead, which integrates emotion
+        playback into the control loop without needing to pause.
+        """
+        self._emotion_playing_event.set()
+        logger.debug("MovementManager paused for emotion animation")
+
+    def resume_after_emotion(self) -> None:
+        """Thread-safe: Resume control loop after emotion animation completes.
+
+        DEPRECATED: Use queue_emotion_move() instead.
+        """
+        self._emotion_playing_event.clear()
+        logger.debug("MovementManager resumed after emotion animation")
+
     def pause_for_robot_disconnect(self) -> None:
         """Thread-safe: Pause control loop when robot is disconnected.
 
@@ -366,31 +380,6 @@ class MovementManager:
             self._last_successful_command = self._now()
             logger.info("MovementManager resumed - robot reconnected")
 
-    def _cancel_active_emotion(self, *, join_timeout: float = 1.0) -> None:
-        """Cancel any in-progress emotion playback.
-
-        Sets `_emotion_cancelled` and waits briefly for the control loop
-        to observe it. We deliberately do NOT call SDK `reachy.cancel_move()` here:
-        that helper calls `media_manager.stop_playing()` as a side effect,
-        which tears down the same audio pipeline `voice_assistant.py` uses
-        for TTS — calling it would silently break voice-assist audio for
-        the rest of the session.
-
-        If the control loop has not observed the cancellation after
-        `join_timeout`, the event is force-cleared so shutdown can continue.
-
-        The bundled emotion `.wav` (if any) plays out naturally; cancelling
-        only stops further pose commands.
-        """
-        self._emotion_cancelled.set()
-        if self._emotion_playing_event.is_set() and self._thread is not None and self._thread.is_alive():
-            deadline = self._now() + max(0.0, join_timeout)
-            while self._emotion_playing_event.is_set() and self._now() < deadline:
-                time.sleep(0.01)
-        self._active_emotion_name = None
-        self._active_emotion_move = None
-        self._emotion_playing_event.clear()
-
     def suspend(self) -> None:
         """Suspend the movement manager runtime resources.
 
@@ -402,8 +391,6 @@ class MovementManager:
             return
 
         logger.info("Suspending MovementManager resources...")
-
-        self._cancel_active_emotion()
 
         # First pause the robot operations
         self.pause_for_robot_disconnect()
@@ -459,91 +446,19 @@ class MovementManager:
         logger.info("MovementManager resumed")
 
     def queue_emotion_move(self, emotion_name: str) -> bool:
-        """Thread-safe: Play an emotion as a primary move in the control loop.
+        """Thread-safe: Queue an emotion move to be played by the control loop.
 
-        The recorded trajectory is queued into MovementManager and evaluated
-        by the same loop that drives idle, voice phases, and face tracking.
-        That keeps `reachy.set_target(...)` owned by one thread at one steady
-        cadence, matching the SDK/reference movement pattern and avoiding
-        stale motor channels across repeated emotions.
+        This method uses the SDK's RecordedMoves.evaluate(t) API to sample
+        emotion poses in the control loop, which avoids conflicts with
+        set_target() calls that would cause "a move is currently running" warnings.
 
         Args:
-            emotion_name: Name of the emotion (e.g., "happy1", "sad1").
+            emotion_name: Name of the emotion (e.g., "happy1", "sad1")
 
         Returns:
-            True if playback was scheduled, False if the emotion library
-            is unavailable or the move failed to load.
+            True if emotion was queued successfully, False otherwise
         """
-        if not is_emotion_available():
-            logger.warning("Cannot play emotion '%s': library not available", emotion_name)
-            return False
-
-        try:
-            recorded_move = get_recorded_move(emotion_name)
-        except Exception as e:
-            logger.error("Failed to load emotion '%s': %s", emotion_name, e)
-            return False
-
-        return self._enqueue_command("emotion_move", (emotion_name, recorded_move), "emotion")
-
-    def _start_emotion_move(self, emotion_name: str, recorded_move) -> None:
-        """Start an emotion as the current primary move inside the control loop."""
-        self._emotion_cancelled.clear()
-        self._active_emotion_name = emotion_name
-        self._active_emotion_move = recorded_move
-        self._emotion_start_time = self._now()
-        self._emotion_playing_event.set()
-        self._pending_action = None
-        self._idle_action_queue.clear()
-        self.state.look_around_in_progress = False
-        has_audio = recorded_move.sound_path is not None
-        logger.info(
-            "Emotion '%s': starting (duration=%.2fs, audio=%s)",
-            emotion_name,
-            recorded_move.duration,
-            "yes" if has_audio else "no",
-        )
-        if has_audio:
-            try:
-                self.robot.media.play_sound(str(recorded_move.sound_path))
-            except Exception:
-                logger.exception("Emotion '%s': play_sound failed", emotion_name)
-
-    def _update_emotion_move(self) -> bool:
-        """Evaluate and issue the active emotion frame from the control loop."""
-        recorded_move = self._active_emotion_move
-        emotion_name = self._active_emotion_name
-        if recorded_move is None or emotion_name is None:
-            return False
-
-        elapsed = self._now() - self._emotion_start_time
-        duration = float(recorded_move.duration)
-        if self._emotion_cancelled.is_set() or elapsed >= duration:
-            if self._emotion_cancelled.is_set():
-                logger.info("Emotion '%s': cancelled", emotion_name)
-            else:
-                logger.info("Emotion '%s': complete", emotion_name)
-            self._active_emotion_name = None
-            self._active_emotion_move = None
-            self._emotion_playing_event.clear()
-            self._emotion_cancelled.clear()
-            return False
-
-        t = min(elapsed, duration - 1e-2)
-        try:
-            head, antennas, body_yaw = recorded_move.evaluate(t)
-            if head is None:
-                return True
-            antenna_tuple = tuple(float(value) for value in antennas) if antennas is not None else (0.0, 0.0)
-            body_yaw_value = float(body_yaw) if body_yaw is not None else 0.0
-            self._issue_control_command(head, antenna_tuple, body_yaw_value)
-        except Exception:
-            logger.exception("Emotion '%s': frame error at t=%.2fs; aborting", emotion_name, t)
-            self._active_emotion_name = None
-            self._active_emotion_move = None
-            self._emotion_playing_event.clear()
-            self._emotion_cancelled.clear()
-        return True
+        return self._enqueue_command("emotion_move", emotion_name, "emotion_move")
 
     def queue_action(self, action: PendingAction) -> None:
         """Thread-safe: Queue a motion action."""
@@ -809,6 +724,25 @@ class MovementManager:
     def _handle_command(self, cmd: str, payload: Any) -> None:
         handle_command(self, cmd, payload)
 
+    def _start_emotion_move(self, emotion_name: str) -> None:
+        """Start playing an emotion move.
+
+        Creates an EmotionMove and sets it as the active emotion, which will
+        be sampled in the control loop via _update_emotion_move().
+        """
+        if not is_emotion_available():
+            logger.warning("Cannot play emotion '%s': emotion library not available", emotion_name)
+            return
+
+        try:
+            emotion_move = EmotionMove(emotion_name)
+            with self._emotion_move_lock:
+                self._emotion_move = emotion_move
+                self._emotion_start_time = self._now()
+            logger.info("Started emotion move: %s (duration=%.2fs)", emotion_name, emotion_move.duration)
+        except Exception as e:
+            logger.error("Failed to start emotion '%s': %s", emotion_name, e)
+
     def _start_action(self, action: PendingAction) -> None:
         start_action(self, action)
 
@@ -994,13 +928,13 @@ class MovementManager:
             duration_s=IDLE_LOOK_AROUND_DURATION,
         )
 
-    def is_emotion_playing(self) -> bool:
-        """Check if an emotion move is currently playing.
+    def _update_emotion_move(self) -> tuple[np.ndarray, tuple[float, float], float] | None:
+        return update_emotion_move(self)
 
-        Backed by `_emotion_playing_event`, which is set while the control
-        loop is evaluating a queued recorded emotion move.
-        """
-        return self._emotion_playing_event.is_set()
+    def is_emotion_playing(self) -> bool:
+        """Check if an emotion move is currently playing."""
+        with self._emotion_move_lock:
+            return self._emotion_move is not None
 
     def _compose_final_pose(self) -> tuple[np.ndarray, tuple[float, float], float]:
         return compose_final_pose(self)
@@ -1077,9 +1011,6 @@ class MovementManager:
             return
 
         logger.info("Stopping movement manager...")
-
-        # Cancel any in-flight emotion (also stops its bundled audio).
-        self._cancel_active_emotion()
 
         # Phase 1: Enter drain mode - stop sending commands to robot
         # This prevents partial command transmission that can crash daemon

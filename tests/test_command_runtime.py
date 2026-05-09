@@ -107,27 +107,6 @@ class IdleRestPoseSourceTests(unittest.TestCase):
         self.assertIn("target_z=self._idle_rest_z_m", content)
 
 
-class EmotionMotionSourceTests(unittest.TestCase):
-    def test_emotions_are_owned_by_control_loop(self):
-        movement_path = Path("reachy_mini_hass/motion/movement_manager.py")
-        movement_content = movement_path.read_text(encoding="utf-8")
-        control_path = Path("reachy_mini_hass/motion/control_runtime.py")
-        control_content = control_path.read_text(encoding="utf-8")
-
-        self.assertIn('self._enqueue_command("emotion_move"', movement_content)
-        self.assertIn("def _update_emotion_move(self) -> bool:", movement_content)
-        self.assertIn("manager._update_emotion_move()", control_content)
-        self.assertNotIn("target=self._emotion_playback_worker", movement_content)
-        self.assertNotIn("manager._emotion_playing_event.is_set()", control_content)
-
-    def test_default_send_rate_matches_control_loop(self):
-        path = Path("reachy_mini_hass/core/config.py")
-        content = path.read_text(encoding="utf-8")
-
-        self.assertIn("control_rate_hz: float = 100.0", content)
-        self.assertIn("max_send_rate_hz: float = 100.0", content)
-
-
 class StopWordSourceTests(unittest.TestCase):
     def test_stop_word_uses_runtime_context_not_active_wakeword_membership(self):
         path = Path("reachy_mini_hass/voice_assistant.py")

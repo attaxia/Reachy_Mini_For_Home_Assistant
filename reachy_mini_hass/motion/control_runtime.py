@@ -43,6 +43,27 @@ def update_face_tracking(manager: "MovementManager", face_detected_threshold: fl
         logger.debug("Error getting face tracking offsets: %s", e)
 
 
+def update_emotion_move(manager: "MovementManager") -> tuple[np.ndarray, tuple[float, float], float] | None:
+    with manager._emotion_move_lock:
+        if manager._emotion_move is None:
+            return None
+        elapsed = manager._now() - manager._emotion_start_time
+        if elapsed >= manager._emotion_move.duration:
+            emotion_name = manager._emotion_move.emotion_name
+            manager._emotion_move = None
+            logger.info("Emotion move complete: %s", emotion_name)
+            return None
+        try:
+            head_pose, antennas, body_yaw = manager._emotion_move.evaluate(elapsed)
+            antenna_tuple = (float(antennas[0]), float(antennas[1]))
+            clamped_body_yaw = clamp_body_yaw(float(body_yaw))
+            return (head_pose, antenna_tuple, clamped_body_yaw)
+        except Exception as e:
+            logger.error("Error sampling emotion pose: %s", e)
+            manager._emotion_move = None
+            return None
+
+
 def compose_final_pose(manager: "MovementManager") -> tuple[np.ndarray, tuple[float, float], float]:
     primary_head = create_head_pose_matrix(
         x=manager.state.target_x,
@@ -102,20 +123,9 @@ def compose_final_pose(manager: "MovementManager") -> tuple[np.ndarray, tuple[fl
 
 
 def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, antennas: tuple[float, float], body_yaw: float) -> None:
-    if manager._draining_event.is_set() or manager._robot_paused_event.is_set():
+    if manager._draining_event.is_set() or manager._emotion_playing_event.is_set() or manager._robot_paused_event.is_set():
         return
     now = manager._now()
-
-    # Cap actual WS sends to Config.motion.max_send_rate_hz. The SDK/reference
-    # movement worker drives set_target from one owner loop near 100Hz; keeping
-    # that cadence prevents individual motor channels from going stale between
-    # repeated primary moves and voice phases.
-    max_send_rate_hz = max(1.0, float(Config.motion.max_send_rate_hz))
-    if max_send_rate_hz < manager._control_loop_hz:
-        min_send_interval = 1.0 / max_send_rate_hz
-        if not manager._connection_lost and (now - manager._last_send_time) < min_send_interval:
-            return
-
     if manager._connection_lost:
         if now - manager._last_reconnect_attempt < manager._reconnect_attempt_interval:
             return
@@ -134,20 +144,6 @@ def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, ant
             manager._connection_lost = False
             manager._reconnect_attempt_interval = manager._reconnect_backoff_initial
             manager._suppressed_errors = 0
-            # During the WS gap, the daemon's per-motor watchdog can drop
-            # torque on individual motors.
-            # `set_target` alone won't move a torque-off motor; we have to
-            # re-energize them explicitly. enable_motors() is idempotent on
-            # already-enabled motors, so this is safe to call unconditionally.
-            # (Trade-off: if the user explicitly disabled motors via HA right
-            # before a reconnect, this would re-enable against their intent.
-            # That window is narrow and recoverable; missing the recovery for
-            # all other users is the worse default.)
-            try:
-                manager.robot.enable_motors()
-                logger.info("Re-enabled motors after reconnect")
-            except Exception:
-                logger.exception("Failed to enable motors after reconnect")
     except Exception as e:
         error_msg = str(e)
         manager._consecutive_errors += 1
@@ -185,19 +181,19 @@ def run_control_loop(manager: "MovementManager", *, max_control_dt_s: float, fac
             if manager._robot_paused_event.is_set():
                 manager._robot_resumed_event.wait(timeout=0.5)
                 continue
-            if manager._update_emotion_move():
-                sleep_time = max(0.0, manager._target_period - (manager._now() - loop_start))
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                continue
-            manager._update_action(dt)
-            manager._update_animation(dt)
-            manager._update_antenna_blend(dt)
-            manager._update_face_tracking()
-            manager._update_animation_blend()
-            manager._update_idle_look_around()
-            head_pose, antennas, body_yaw = manager._compose_final_pose()
-            manager._issue_control_command(head_pose, antennas, body_yaw)
+            emotion_pose = manager._update_emotion_move()
+            if emotion_pose is not None:
+                head_pose, antennas, body_yaw = emotion_pose
+                manager._issue_control_command(head_pose, antennas, body_yaw)
+            else:
+                manager._update_action(dt)
+                manager._update_animation(dt)
+                manager._update_antenna_blend(dt)
+                manager._update_face_tracking()
+                manager._update_animation_blend()
+                manager._update_idle_look_around()
+                head_pose, antennas, body_yaw = manager._compose_final_pose()
+                manager._issue_control_command(head_pose, antennas, body_yaw)
         except Exception as e:
             manager._log_error_throttled(f"Control loop error: {e}")
         sleep_time = max(0.0, manager._target_period - (manager._now() - loop_start))
