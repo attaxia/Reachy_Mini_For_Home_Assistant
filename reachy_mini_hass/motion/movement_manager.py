@@ -571,10 +571,14 @@ class MovementManager:
                 except Exception:
                     logger.exception("Emotion '%s': play_sound failed", emotion_name)
 
-            # 3. Stream the trajectory at 100Hz. Use set_target() (combined),
-            #    matching the rest of MovementManager so the daemon stays in
-            #    a single, consistent command mode.
-            play_period = 1.0 / 100.0
+            # 3. Stream the trajectory using set_target() (combined), matching
+            #    the rest of MovementManager so the daemon stays in a single,
+            #    consistent command mode. We use the same `max_send_rate_hz`
+            #    cap as the regular control loop — sending much faster than
+            #    that drowned the daemon's WS heartbeat under combined audio
+            #    + 100Hz traffic, eventually killing the connection for the
+            #    rest of the session.
+            play_period = 1.0 / max(1.0, float(Config.motion.max_send_rate_hz))
             t0 = time.monotonic()
             duration = float(recorded_move.duration)
             while True:

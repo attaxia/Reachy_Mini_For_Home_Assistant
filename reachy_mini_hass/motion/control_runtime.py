@@ -105,6 +105,18 @@ def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, ant
     if manager._draining_event.is_set() or manager._emotion_playing_event.is_set() or manager._robot_paused_event.is_set():
         return
     now = manager._now()
+
+    # Cap actual WS sends to Config.motion.max_send_rate_hz (default 15Hz).
+    # The control loop itself runs at 100Hz to keep face tracking and animation
+    # state fresh, but we only need ~15Hz on the daemon WS to drive the motors
+    # smoothly. Sending faster has been observed to silently kill the daemon's
+    # WS heartbeat — after which the SDK's `_is_alive` flips to False and every
+    # subsequent set_target raises "Lost connection" with no automatic recovery,
+    # leaving the head frozen for the rest of the session.
+    min_send_interval = 1.0 / max(1.0, float(Config.motion.max_send_rate_hz))
+    if not manager._connection_lost and (now - manager._last_send_time) < min_send_interval:
+        return
+
     if manager._connection_lost:
         if now - manager._last_reconnect_attempt < manager._reconnect_attempt_interval:
             return
