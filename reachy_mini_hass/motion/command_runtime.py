@@ -150,6 +150,15 @@ def start_emotion_move(manager: "MovementManager", emotion_name: str) -> None:
         # transition.
         manager._at_deep_sleep_pose = False
         logger.info("Started emotion move: %s (duration=%.2fs)", emotion_name, emotion_move.duration)
+        # Kick off the bundled .wav alongside the motion. media.play_sound
+        # is non-blocking (GStreamer queues it) so this does not slow the
+        # control loop. Wrapped so audio failure can never block motion.
+        sound_path = emotion_move.sound_path
+        if sound_path is not None:
+            try:
+                manager.robot.media.play_sound(str(sound_path))
+            except Exception:
+                logger.exception("Emotion '%s': play_sound failed", emotion_name)
     except Exception as e:
         logger.error("Failed to start emotion '%s': %s", emotion_name, e)
 
