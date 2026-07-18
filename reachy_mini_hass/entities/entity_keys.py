@@ -23,7 +23,6 @@ ENTITY_KEYS: dict[str, int] = {
     "sendspin_enabled": 105,
     "face_tracking_enabled": 106,
     "gesture_detection_enabled": 107,
-    "face_confidence_threshold": 108,
     "camera_disabled": 109,
     # Phase 2: Runtime controls (200-299)
     "motor_mode": 201,
@@ -67,6 +66,9 @@ ENTITY_KEYS: dict[str, int] = {
     "camera": 1001,
     # Phase 21: Continuous conversation (1500-1599)
     "continuous_conversation": 1500,
+    "thinking_sound_enabled": 1501,
+    "wake_word_sensitivity": 1502,
+    "stop_word_sensitivity": 1503,
     # Phase 22: Gesture detection (1600-1699)
     "gesture_detected": 1600,
     "gesture_confidence": 1601,
@@ -86,6 +88,10 @@ ENTITY_KEYS: dict[str, int] = {
     "services_suspended": 1901,
     # Phase 26: DOA tracking control (2000+)
     "doa_tracking_enabled": 2000,
+    # Phase 27: Media metadata (2100-2199)
+    "media_title": 2100,
+    "media_artist": 2101,
+    "media_album": 2102,
 }
 
 

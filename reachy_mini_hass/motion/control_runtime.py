@@ -1,4 +1,4 @@
-﻿"""Pose and control loop helpers for `MovementManager`."""
+"""Pose and control loop helpers for `MovementManager`."""
 
 from __future__ import annotations
 
@@ -19,30 +19,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def update_face_tracking(manager: "MovementManager", face_detected_threshold: float) -> None:
-    if manager._camera_server is None:
-        return
-    try:
-        raw_offsets = manager._camera_server.get_face_tracking_offsets()
-        offsets_for_motion = raw_offsets
-        if manager.state.robot_state == RobotState.IDLE and not manager._idle_motion_enabled:
-            offsets_for_motion = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        with manager._face_tracking_lock:
-            manager._face_tracking_offsets = offsets_for_motion
-        offset_magnitude = sum(abs(o) for o in raw_offsets)
-        face_now_detected = offset_magnitude > face_detected_threshold
-        if face_now_detected:
-            if not manager.state.face_detected:
-                logger.debug("Face detected")
-            manager.state.face_detected = True
-        else:
-            if manager.state.face_detected:
-                logger.debug("Face lost")
-            manager.state.face_detected = False
-    except Exception as e:
-        logger.debug("Error getting face tracking offsets: %s", e)
-
-
 def update_emotion_move(manager: "MovementManager") -> tuple[np.ndarray, tuple[float, float], float] | None:
     with manager._emotion_move_lock:
         if manager._emotion_move is None:
@@ -52,7 +28,7 @@ def update_emotion_move(manager: "MovementManager") -> tuple[np.ndarray, tuple[f
             emotion_name = manager._emotion_move.emotion_name
             manager._emotion_move = None
             logger.info("Emotion move complete: %s", emotion_name)
-            _return_to_rest_if_deep_sleep(manager)
+            _fire_emotion_complete(manager, emotion_name)
             return None
         try:
             head_pose, antennas, body_yaw = manager._emotion_move.evaluate(elapsed)
@@ -62,26 +38,19 @@ def update_emotion_move(manager: "MovementManager") -> tuple[np.ndarray, tuple[f
         except Exception as e:
             logger.error("Error sampling emotion pose: %s", e)
             manager._emotion_move = None
-            _return_to_rest_if_deep_sleep(manager)
+            _fire_emotion_complete(manager, "<error>")
             return None
 
 
-def _return_to_rest_if_deep_sleep(manager: "MovementManager") -> None:
-    """Smoothly transition back into the deep sleep rest pose if the user
-    has the deep sleep mode active (idle_behavior disabled) and the robot
-    is now in IDLE state. Called at the end of an emotion and on
-    voice-phase return to IDLE so the head settles back to its resting
-    position. No-op if the user has chosen the raised idle mode.
-    """
-    if manager.state.robot_state != RobotState.IDLE:
+def _fire_emotion_complete(manager: "MovementManager", emotion_name: str) -> None:
+    """Invoke the (optional) emotion-completion callback outside the lock."""
+    callback = getattr(manager, "_on_emotion_complete_callback", None)
+    if callback is None:
         return
-    if manager._idle_behavior_enabled():
-        return
-    # Lazy import avoids a circular dependency between control_runtime
-    # and idle_runtime at module load.
-    from .idle_runtime import transition_or_apply_idle_rest_pose
-
-    transition_or_apply_idle_rest_pose(manager, duration=2.0)
+    try:
+        callback(emotion_name)
+    except Exception as e:
+        logger.debug("Emotion-complete callback error: %s", e)
 
 
 def compose_final_pose(manager: "MovementManager") -> tuple[np.ndarray, tuple[float, float], float]:
@@ -93,16 +62,19 @@ def compose_final_pose(manager: "MovementManager") -> tuple[np.ndarray, tuple[fl
         pitch=manager.state.target_pitch,
         yaw=manager.state.target_yaw,
     )
-    with manager._face_tracking_lock:
-        face_offsets = manager._face_tracking_offsets
+    # Face tracking offsets are no longer composed here: the SDK daemon-side
+    # head tracker blends its own aim into the IK output via start_head_tracking,
+    # so our `set_target` calls provide only the "base" pose. Speech sway is
+    # likewise handled by the daemon when ReachyMini.enable_wobbling() is used,
+    # so only the local animation layer is composed here.
     anim_blend = manager.state.animation_blend
     secondary_head = create_head_pose_matrix(
-        x=manager.state.anim_x * anim_blend + manager.state.sway_x + face_offsets[0],
-        y=manager.state.anim_y * anim_blend + manager.state.sway_y + face_offsets[1],
-        z=manager.state.anim_z * anim_blend + manager.state.sway_z + face_offsets[2],
-        roll=manager.state.anim_roll * anim_blend + manager.state.sway_roll + face_offsets[3],
-        pitch=manager.state.anim_pitch * anim_blend + manager.state.sway_pitch + face_offsets[4],
-        yaw=manager.state.anim_yaw * anim_blend + manager.state.sway_yaw + face_offsets[5],
+        x=manager.state.anim_x * anim_blend,
+        y=manager.state.anim_y * anim_blend,
+        z=manager.state.anim_z * anim_blend,
+        roll=manager.state.anim_roll * anim_blend,
+        pitch=manager.state.anim_pitch * anim_blend,
+        yaw=manager.state.anim_yaw * anim_blend,
     )
     final_head = compose_poses(primary_head, secondary_head)
 
@@ -117,17 +89,9 @@ def compose_final_pose(manager: "MovementManager") -> tuple[np.ndarray, tuple[fl
         manager._last_idle_antenna_update = 0.0
 
     final_head_yaw = extract_yaw_from_pose(final_head)
-    if manager._user_body_yaw_override is not None:
-        # User has manually set body yaw via the HA entity. Honor it
-        # persistently instead of letting the auto-derivation (head-yaw
-        # coupling + idle-with-no-face zero) overwrite it on every tick.
-        # The override is cleared on transition out of IDLE (so voice
-        # phases / face tracking re-couple body to head naturally).
-        target_body_yaw = clamp_body_yaw(manager._user_body_yaw_override)
-    else:
-        target_body_yaw = clamp_body_yaw(final_head_yaw)
-        if manager.state.robot_state == RobotState.IDLE and not manager.state.face_detected:
-            target_body_yaw = 0.0
+    target_body_yaw = clamp_body_yaw(final_head_yaw)
+    if manager.state.robot_state == RobotState.IDLE and not manager.state.face_detected:
+        target_body_yaw = 0.0
 
     now = manager._now()
     if manager._body_yaw_smoothed is None:
@@ -197,7 +161,7 @@ def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, ant
             manager._log_error_throttled(f"Failed to set robot target: {error_msg}")
 
 
-def run_control_loop(manager: "MovementManager", *, max_control_dt_s: float, face_detected_threshold: float) -> None:
+def run_control_loop(manager: "MovementManager", *, max_control_dt_s: float) -> None:
     logger.info("Movement manager control loop started (%.1f Hz)", manager._control_loop_hz)
     last_time = manager._now()
     while not manager._stop_event.is_set():
@@ -217,33 +181,13 @@ def run_control_loop(manager: "MovementManager", *, max_control_dt_s: float, fac
                 manager._update_action(dt)
                 manager._update_animation(dt)
                 manager._update_antenna_blend(dt)
-                manager._update_face_tracking()
                 manager._update_animation_blend()
                 manager._update_idle_look_around()
                 head_pose, antennas, body_yaw = manager._compose_final_pose()
                 manager._issue_control_command(head_pose, antennas, body_yaw)
-            _publish_deep_sleep_state_if_changed(manager)
         except Exception as e:
             manager._log_error_throttled(f"Control loop error: {e}")
         sleep_time = max(0.0, manager._target_period - (manager._now() - loop_start))
         if sleep_time > 0:
             time.sleep(sleep_time)
     logger.info("Movement manager control loop stopped")
-
-
-def _publish_deep_sleep_state_if_changed(manager: "MovementManager") -> None:
-    """Detect transitions of `is_in_deep_sleep_state()` and fire the
-    registered publish callback so the HA "Deep Sleep" switch entity can
-    push its new value to Home Assistant. No-op when no callback is
-    registered (i.e., before HA connects)."""
-    callback = manager._deep_sleep_state_callback
-    if callback is None:
-        return
-    current = manager.is_in_deep_sleep_state()
-    if current == manager._last_published_deep_sleep_state:
-        return
-    manager._last_published_deep_sleep_state = current
-    try:
-        callback()
-    except Exception:
-        logger.exception("deep sleep state publish callback failed")

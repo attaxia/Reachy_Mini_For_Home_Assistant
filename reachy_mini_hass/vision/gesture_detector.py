@@ -15,6 +15,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MIN_DETECTION_SCORE = 0.15
+_MIN_CLASSIFICATION_SCORE = 0.35
+
 
 class Gesture(Enum):
     NONE = "no_gesture"
@@ -110,14 +113,15 @@ _NAME_TO_GESTURE = {
 
 class GestureDetector:
     def __init__(self):
-        models_dir = Path(__file__).parent / "models"
+        models_dir = Path(__file__).resolve().parents[1] / "models"
         self._detector_path = models_dir / "hand_detector.onnx"
         self._classifier_path = models_dir / "crops_classifier.onnx"
         if not self._detector_path.exists() or not self._classifier_path.exists():
             raise FileNotFoundError(
-                "Gesture model files are missing in vision/models. "
+                "Gesture model files are missing. "
                 "Please reinstall reachy_mini_hass and ensure "
-                "hand_detector.onnx and crops_classifier.onnx are present."
+                "hand_detector.onnx and crops_classifier.onnx are present in "
+                f"{models_dir}."
             )
         self._detector = None
         self._classifier = None
@@ -193,7 +197,13 @@ class GestureDetector:
         boxes = outs[0]
         scores = outs[2]
 
-        # Return all detections (no threshold filtering - let downstream handle it)
+        # Keep weak-but-real candidates, but discard obvious detector junk.
+        if len(boxes) == 0:
+            return np.empty((0, 4)), np.empty((0,))
+
+        valid_scores = scores >= _MIN_DETECTION_SCORE
+        boxes = boxes[valid_scores]
+        scores = scores[valid_scores]
         if len(boxes) == 0:
             return np.empty((0, 4)), np.empty((0,))
 
@@ -269,13 +279,14 @@ class GestureDetector:
             idx = int(np.argmax(logit))
             exp_l = np.exp(logit - np.max(logit))
             conf = float(exp_l[idx] / np.sum(exp_l))
-            # No confidence filtering - return all classifications
-            # This allows Home Assistant to see all detected gestures with their confidence levels
             if idx >= len(_GESTURE_CLASSES):
                 gestures.append(Gesture.NONE)
             else:
                 name = _GESTURE_CLASSES[idx]
-                gestures.append(_NAME_TO_GESTURE.get(name, Gesture.NONE))
+                if conf < _MIN_CLASSIFICATION_SCORE:
+                    gestures.append(Gesture.NONE)
+                else:
+                    gestures.append(_NAME_TO_GESTURE.get(name, Gesture.NONE))
             confidences.append(conf)
 
         return gestures, confidences

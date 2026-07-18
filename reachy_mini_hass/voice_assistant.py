@@ -8,6 +8,7 @@ with Home Assistant via ESPHome protocol.
 """
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -15,10 +16,9 @@ from collections import deque
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from queue import Queue
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import requests
 from reachy_mini import ReachyMini
 
 from .audio.audio_player import AudioPlayer
@@ -191,7 +191,7 @@ class VoiceAssistantService:
         # Start Reachy Mini media system
         try:
             media = self.reachy_mini.media
-            daemon_status = self.reachy_mini.client.get_status()
+            daemon_status = self._get_daemon_status()
 
             if getattr(self.reachy_mini, "media_released", False):
                 raise RuntimeError("Reachy Mini media has been released externally; this app requires SDK-owned media")
@@ -335,11 +335,9 @@ class VoiceAssistantService:
         if self._camera_server is not None:
             prefs = self._state.preferences
             self._camera_server.apply_runtime_vision_state(
-                face_requested=bool(prefs.face_tracking_enabled),
                 gesture_requested=bool(prefs.gesture_detection_enabled),
                 models_allowed=True,
             )
-            self._camera_server.set_face_confidence_threshold(float(prefs.face_confidence_threshold))
             return
 
         self._camera_server = MJPEGCameraServer(
@@ -348,18 +346,15 @@ class VoiceAssistantService:
             port=self.camera_port,
             fps=15,
             quality=80,
-            enable_face_tracking=bool(self._state.preferences.face_tracking_enabled),
             enable_gesture_detection=bool(self._state.preferences.gesture_detection_enabled),
             gstreamer_lock=self._gstreamer_lock,
         )
 
         prefs = self._state.preferences
         self._camera_server.apply_runtime_vision_state(
-            face_requested=bool(prefs.face_tracking_enabled),
             gesture_requested=bool(prefs.gesture_detection_enabled),
             models_allowed=True,
         )
-        self._camera_server.set_face_confidence_threshold(float(prefs.face_confidence_threshold))
         await self._camera_server.start()
 
         self._state._camera_server = self._camera_server
@@ -394,6 +389,13 @@ class VoiceAssistantService:
 
         await self._stop_camera_server_if_running(reason=reason)
 
+    def _get_daemon_status(self) -> Any:
+        """Return the current daemon status, or None if unavailable."""
+        try:
+            return self.reachy_mini.client.get_status()
+        except Exception:
+            return None
+
     def _probe_audio_capture_ready(self, media, timeout_s: float = 1.5) -> bool:
         """Check whether microphone samples become available shortly after startup."""
         deadline = time.monotonic() + timeout_s
@@ -412,7 +414,7 @@ class VoiceAssistantService:
         _LOGGER.warning("Suspending voice services (%s)", reason)
         self._robot_services_paused.set()
         self._robot_services_resumed.clear()
-        self._set_service_state(suspended=True)
+        self._set_services_state(suspended=True)
         self._audio_buffer.clear()
         self._suspend_satellite()
         self._set_audio_players_suspended(True)
@@ -424,7 +426,7 @@ class VoiceAssistantService:
         """Resume only voice-related services."""
         _LOGGER.info("Resuming voice services (%s)", reason)
         self._robot_services_paused.clear()
-        self._set_service_state(suspended=False)
+        self._set_services_state(suspended=False)
         self._start_media_system()
         self._resume_satellite()
         self._set_audio_players_suspended(False)
@@ -437,7 +439,7 @@ class VoiceAssistantService:
         _LOGGER.warning("Suspending non-ESPHome services (%s)", reason)
         self._robot_services_paused.set()
         self._robot_services_resumed.clear()
-        self._set_service_state(suspended=True)
+        self._set_services_state(suspended=True)
         self._audio_buffer.clear()
 
         if self._camera_server is not None and self._state.camera_enabled:
@@ -464,7 +466,7 @@ class VoiceAssistantService:
         """Resume all non-ESPHome services after runtime suspension."""
         _LOGGER.info("Resuming non-ESPHome services (%s)", reason)
         self._robot_services_paused.clear()
-        self._set_service_state(suspended=False)
+        self._set_services_state(suspended=False)
         self._start_media_system()
 
         if self._camera_server is not None and self._state.camera_enabled:
@@ -487,7 +489,7 @@ class VoiceAssistantService:
 
         _LOGGER.info("All services resumed - system fully operational")
 
-    def _set_service_state(self, *, suspended: bool) -> None:
+    def _set_services_state(self, *, suspended: bool) -> None:
         if self._state is None:
             return
         self._state.services_suspended = suspended
@@ -652,6 +654,12 @@ class VoiceAssistantService:
         if self._camera_server and self._state.camera_enabled:
             await self._camera_server.stop(join_timeout=Config.shutdown.camera_stop_timeout)
             self._camera_server = None
+        # Disable SDK head wobbler via the public ReachyMini API so the
+        # daemon also stops composing sway offsets.
+        try:
+            self.reachy_mini.disable_wobbling()
+        except Exception:
+            pass
         # Close SDK media resources to prevent memory leaks (even if camera is disabled)
         try:
             self.reachy_mini.media.close()
@@ -844,21 +852,50 @@ class VoiceAssistantService:
     def _get_reachy_audio_chunk(self) -> bytes | None:
         """Get fixed-size audio chunk from Reachy Mini's microphone.
 
-        Returns exactly AUDIO_BLOCK_SIZE samples each time, buffering
-        internally to ensure consistent chunk sizes for streaming.
+        Aggressively fills the internal deque buffer by pulling audio samples
+        from the SDK in a tight loop (the SDK's 20 ms appsink timeout acts as
+        the natural throttle).  Returns ``AUDIO_BLOCK_SIZE`` PCM bytes once
+        enough mono float32 samples have accumulated.
+
+        Unlike a single-shot poll, this loop keeps the stream gapless ---
+        critical for downstream VAD/STT which reset on gaps or missing chunks.
 
         Returns:
-            PCM audio bytes of fixed size, or None if not enough data.
+            PCM audio bytes of fixed size, or ``None`` if services are paused.
         """
-        # Check if services are paused (e.g., during sleep/disconnect)
         if self._robot_services_paused.is_set():
             return None
 
-        # Get new audio data from SDK
-        audio_data = self.reachy_mini.media.get_audio_sample()
+        max_polls = 20  # safety valve; appsink try_pull_sample() throttles naturally
+        for _poll in range(max_polls):
+            if len(self._audio_buffer) >= AUDIO_BLOCK_SIZE:
+                break
+            audio_data = self.reachy_mini.media.get_audio_sample()
+            if audio_data is None:
+                continue
+            self._ingest_audio_sample(audio_data)
 
-        # Debug: Log SDK audio data statistics and sample rate (once at startup)
-        if audio_data is not None and isinstance(audio_data, np.ndarray) and audio_data.size > 0:
+        if len(self._audio_buffer) < AUDIO_BLOCK_SIZE:
+            return None
+
+        chunk = [self._audio_buffer.popleft() for _ in range(AUDIO_BLOCK_SIZE)]
+        chunk_array = np.array(chunk, dtype=np.float32)
+        pcm_bytes = (np.clip(chunk_array, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+        return pcm_bytes
+
+    def _ingest_audio_sample(self, audio_data) -> None:
+        """Validate, convert and buffer one audio sample from the SDK.
+
+        Handles float32 validation, mono extraction and sample-rate logging.
+        All recoverable conversion errors are silently dropped so that one
+        bad frame does not stall the pipeline.
+        """
+        try:
+            if (not isinstance(audio_data, np.ndarray)) or audio_data.size == 0:
+                return
+            if audio_data.dtype.kind in ("S", "U", "O", "V", "b"):
+                return
+
             if not hasattr(self, "_audio_sample_rate_logged"):
                 self._audio_sample_rate_logged = True
                 try:
@@ -869,84 +906,23 @@ class VoiceAssistantService:
                         audio_data.shape,
                         audio_data.dtype,
                     )
-                    if input_rate != 16000:
-                        _LOGGER.warning(
-                            "Audio sample rate mismatch! Got %d Hz, expected 16000 Hz. "
-                            "STT may be slow or inaccurate. Consider resampling.",
-                            input_rate,
-                        )
                 except Exception as e:
                     _LOGGER.warning("Could not get audio sample rate: %s", e)
 
-        # Append new data to buffer if valid
-        if audio_data is not None and isinstance(audio_data, np.ndarray) and audio_data.size > 0:
-            try:
-                if audio_data.dtype.kind not in ("S", "U", "O", "V", "b"):
-                    # Convert to float32 only if needed (SDK already returns float32)
-                    if audio_data.dtype != np.float32:
-                        audio_data = audio_data.astype(np.float32, copy=False)
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32, copy=False)
+            audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=1.0, neginf=-1.0)
 
-                    # Clean NaN/Inf values early to prevent downstream errors
-                    audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=1.0, neginf=-1.0)
+            if audio_data.ndim == 2 and audio_data.shape[1] >= 2:
+                audio_data = audio_data[:, 0]
+            elif audio_data.ndim == 2:
+                audio_data = audio_data[:, 0]
+            if audio_data.ndim != 1:
+                return
 
-                    # Convert stereo to mono (use first channel for better quality)
-                    if audio_data.ndim == 2 and audio_data.shape[1] >= 2:
-                        # Use first channel instead of mean - cleaner signal
-                        # Remove .copy() to avoid unnecessary array duplication
-                        audio_data = audio_data[:, 0]
-                    elif audio_data.ndim == 2:
-                        # Remove .copy() to avoid unnecessary array duplication
-                        audio_data = audio_data[:, 0]
-
-                    # Resample if needed (SDK may return non-16kHz audio)
-                    if audio_data.ndim == 1:
-                        # Initialize sample rate once (not every chunk)
-                        if not hasattr(self, "_input_sample_rate_fixed"):
-                            try:
-                                self._input_sample_rate = self.reachy_mini.media.get_input_audio_samplerate()
-                                if self._input_sample_rate != 16000:
-                                    _LOGGER.warning(
-                                        f"Sample rate {self._input_sample_rate} != 16000 Hz. "
-                                        "Performance may be degraded. "
-                                        "Consider forcing 16kHz in hardware config."
-                                    )
-                            except Exception:
-                                self._input_sample_rate = 16000
-
-                            self._input_sample_rate_fixed = True  # Mark as fixed
-
-                        # Resample to 16kHz if needed
-                        if self._input_sample_rate != 16000 and self._input_sample_rate > 0:
-                            from scipy.signal import resample
-
-                            new_length = int(len(audio_data) * 16000 / self._input_sample_rate)
-                            if new_length > 0:
-                                audio_data = resample(audio_data, new_length)
-                                audio_data = np.nan_to_num(
-                                    audio_data,
-                                    nan=0.0,
-                                    posinf=1.0,
-                                    neginf=-1.0,
-                                ).astype(np.float32, copy=False)
-
-                        # Extend deque (deque automatically handles overflow with maxlen)
-                        # This avoids creating new arrays like np.concatenate does
-                        self._audio_buffer.extend(audio_data)
-
-            except (TypeError, ValueError):
-                pass
-
-        # Return fixed-size chunk if we have enough data
-        if len(self._audio_buffer) >= AUDIO_BLOCK_SIZE:
-            # Extract chunk and remove from buffer
-            chunk = [self._audio_buffer.popleft() for _ in range(AUDIO_BLOCK_SIZE)]
-
-            # Convert to PCM bytes (16-bit signed, little-endian)
-            chunk_array = np.array(chunk, dtype=np.float32)
-            pcm_bytes = (np.clip(chunk_array, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-            return pcm_bytes
-
-        return None
+            self._audio_buffer.extend(audio_data)
+        except (TypeError, ValueError):
+            pass
 
     def _convert_to_pcm(self, audio_chunk_array: np.ndarray) -> bytes:
         """Convert float32 audio array to 16-bit PCM bytes."""
@@ -1011,9 +987,10 @@ class VoiceAssistantService:
                     if wake_word.process_streaming(micro_input):
                         activated = True
             elif isinstance(wake_word, OpenWakeWord):
+                sensitivity = 1.0 - self._state.preferences.wake_word_sensitivity
                 for oww_input in ctx.oww_inputs:
                     for prob in wake_word.process_streaming(oww_input):
-                        if prob > 0.5:
+                        if prob > sensitivity:
                             activated = True
 
             if activated:

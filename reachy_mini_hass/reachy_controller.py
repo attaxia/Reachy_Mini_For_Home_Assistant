@@ -488,30 +488,14 @@ class ReachyController:
     def set_body_yaw(self, yaw_deg: float) -> None:
         """Set body yaw angle in degrees.
 
-        The MovementManager control loop runs at ~100Hz and ordinarily
-        overrides body yaw on every iteration with a head-yaw-coupled
-        value (and resets to 0 in idle without a face detected). A bare
-        `set_target_body_yaw` call from here would last ~10ms before
-        being overwritten - which was the user-visible "body yaw control
-        does nothing" symptom.
-
-        Route the request through MovementManager's
-        `_user_body_yaw_override` so the user-commanded value persists
-        across ticks. The override is cleared automatically when the
-        robot transitions out of IDLE (voice phases re-couple body to
-        head naturally).
+        Note: This directly calls SDK's set_target_body_yaw since automatic body yaw
+        is enabled. Manual control will temporarily override automatic mode.
         """
-        yaw_rad = math.radians(yaw_deg)
-        if self._movement_manager is not None:
-            self._movement_manager.set_user_body_yaw(yaw_rad)
-            return
-        # Fallback for when MovementManager isn't wired yet (early init):
-        # at least try the bare SDK call so the request isn't lost.
         if self.reachy is None:
             self._disabled_pose_setter("body_yaw")
             return
         try:
-            self.reachy.set_target_body_yaw(yaw_rad)
+            self.reachy.set_target_body_yaw(math.radians(yaw_deg))
         except Exception as e:
             logger.error(f"Error setting body yaw: {e}")
 

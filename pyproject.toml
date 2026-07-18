@@ -4,18 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reachy_mini_hass"
-version = "1.0.7"
+version = "1.0.8"
 description = "Deep integration of Reachy Mini robot with Home Assistant"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
 dependencies = [
     # Reachy Mini SDK with gstreamer support (for camera streaming)
-    "reachy-mini>=1.7.1",
+    "reachy-mini>=1.9.0",
 
     # Audio processing (for audio file analysis)
     "soundfile>=0.13.0",
-    "numpy>=2.2.5,<=2.2.5",
+    "numpy>=2.2.5,<3.0.0",
 
     # Camera streaming
     "opencv-python>=4.12.0.88",
@@ -29,28 +29,20 @@ dependencies = [
     "aioesphomeapi>=43.10.1",
     "zeroconf>=0.131,<1",
     "websockets>=12,<16",
-    "aiohttp",
+    "aiohttp>=3.9.0",
 
     # Motion control (head movements)
     "scipy>=1.15.3,<2.0.0",
 
-    # Face tracking (YOLO-based head detection)
-    "ultralytics",
-    "supervision",
-
     # Sendspin synchronized audio (optional, for multi-room playback)
-    "aiosendspin>=5.1,<6.0",
+    "aiosendspin>=6.0,<7.0",
 
     # Gesture detection (ONNX runtime for HaGRID models)
     "onnxruntime>=1.18.0",
 
-    # PyTorch (for vision models)
-    "torch==2.5.1",
-    "torchvision==0.20.1",
-
     # Compatibility with system packages (gradio, etc.)
-    "pillow<12.0",
-    "pydantic<=2.12.5",
+    "pillow>=10.0,<12.0",
+    "pydantic>=2.0,<=2.12.5",
     "requests>=2.33.0",
 ]
 keywords = ["reachy-mini-app", "reachy-mini", "home-assistant", "voice-assistant"]
@@ -66,7 +58,7 @@ include-package-data = true
 where = ["."]
 
 [tool.setuptools.package-data]
-"*" = ["*.json", "*.flac", "*.md", "*.tflite", "*.onnx", "*.pt"]
+"*" = ["*.json", "*.flac", "*.md", "*.tflite", "*.onnx"]
 
 # ============================================================================
 # Ruff - Fast Python linter and formatter
@@ -172,7 +164,6 @@ exclude = [
 [[tool.mypy.overrides]]
 module = [
     "reachy_mini_hass.core.*",
-    "reachy_mini_hass.motion.smoothing",
     "reachy_mini_hass.motion.pose_composer",
 ]
 disallow_untyped_defs = true

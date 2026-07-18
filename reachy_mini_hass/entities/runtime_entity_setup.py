@@ -124,66 +124,6 @@ def setup_runtime_entities(registry: "EntityRegistry", entities: list) -> None:
         )
     )
 
-    # Deep Sleep switch. Reflects the *runtime* state, not just the
-    # preference: while the head is being lifted for an emotion or while
-    # listening/speaking, the toggle shows OFF; once the robot settles
-    # back into the deep sleep rest pose it shows ON. Toggling the switch
-    # changes the configured idle mode (idle_behavior_enabled, inverted)
-    # so transitions kick in immediately.
-    def _movement_manager():
-        if registry.reachy_controller is None:
-            return None
-        return registry.reachy_controller._movement_manager
-
-    def get_deep_sleep() -> bool:
-        manager = _movement_manager()
-        if manager is not None:
-            return manager.is_in_deep_sleep_state()
-        # Fallback when MovementManager isn't reachable yet: use the
-        # configured preference so the switch at least reflects intent.
-        prefs = registry._get_preferences()
-        return not bool(prefs.idle_behavior_enabled) if prefs is not None else True
-
-    def set_deep_sleep(enabled: bool) -> None:
-        registry._set_idle_behavior_enabled(not enabled)
-
-    deep_sleep_entity = SwitchEntity(
-        server=registry.server,
-        key=get_entity_key("deep_sleep_mode"),
-        name="Deep Sleep",
-        object_id="deep_sleep_mode",
-        icon="mdi:bed",
-        entity_category=0,  # 0 = primary control (shows under Controls in HA)
-        value_getter=get_deep_sleep,
-        value_setter=set_deep_sleep,
-    )
-    entities.append(deep_sleep_entity)
-    registry._deep_sleep_switch_entity = deep_sleep_entity
-
-    # Wire the runtime state -> entity push path. ESPHome is push-based;
-    # without this, HA only sees state changes when the user clicks the
-    # toggle. MovementManager runs in its own thread, so we route the
-    # update through the voice assistant's asyncio loop with
-    # call_soon_threadsafe — asyncio transports are not thread-safe and
-    # send_messages() ultimately writes to one.
-    manager = _movement_manager()
-    if manager is not None:
-        def _publish_deep_sleep_state() -> None:
-            voice_assistant = getattr(registry.server, "_voice_assistant_service", None)
-            loop = getattr(voice_assistant, "_event_loop", None) if voice_assistant else None
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(deep_sleep_entity.update_state)
-            else:
-                # Bootstrap path before the asyncio loop is captured —
-                # rare; safe because we're still on whatever thread
-                # spawned the manager.
-                try:
-                    deep_sleep_entity.update_state()
-                except Exception:
-                    _LOGGER.debug("deep_sleep_entity.update_state() failed", exc_info=True)
-
-        manager.set_deep_sleep_state_callback(_publish_deep_sleep_state)
-
     def sync_sendspin() -> None:
         registry.server._voice_assistant_service.set_sendspin_enabled(registry._get_pref_bool("sendspin_enabled"))
 
@@ -216,29 +156,6 @@ def setup_runtime_entities(registry: "EntityRegistry", entities: list) -> None:
         after_set=registry._apply_vision_runtime_state,
     )
     entities.append(registry._gesture_detection_switch_entity)
-
-    def get_face_confidence_threshold() -> float:
-        return registry._get_pref_float("face_confidence_threshold", 0.5)
-
-    def set_face_confidence_threshold(value: float) -> None:
-        value = max(0.0, min(1.0, float(value)))
-        registry._set_pref_float("face_confidence_threshold", value)
-        if registry.camera_server is not None:
-            registry.camera_server.set_face_confidence_threshold(value)
-
-    entities.append(
-        registry._make_preference_number(
-            key_name="face_confidence_threshold",
-            name="Face Confidence",
-            object_id="face_confidence_threshold",
-            icon="mdi:target",
-            getter=get_face_confidence_threshold,
-            setter=set_face_confidence_threshold,
-            min_value=0.0,
-            max_value=1.0,
-            step=0.01,
-        )
-    )
 
     _LOGGER.debug("Phase 1 entities registered")
 
@@ -291,6 +208,65 @@ def setup_behavior_entities(registry: "EntityRegistry", entities: list) -> None:
             entity_category=1,
             value_getter=lambda: registry._get_pref_bool("continuous_conversation"),
             value_setter=lambda enabled: registry._set_pref_bool("continuous_conversation", enabled),
+        )
+    )
+
+    entities.append(
+        SwitchEntity(
+            server=registry.server,
+            key=get_entity_key("thinking_sound_enabled"),
+            name="Thinking Sound",
+            object_id="thinking_sound_enabled",
+            icon="mdi:brain",
+            entity_category=1,
+            value_getter=lambda: registry._get_pref_bool("thinking_sound_enabled"),
+            value_setter=lambda enabled: registry._set_pref_bool("thinking_sound_enabled", enabled),
+        )
+    )
+
+    def get_wake_word_sensitivity() -> float:
+        return float(registry._get_pref_float("wake_word_sensitivity", 0.7))
+
+    def set_wake_word_sensitivity(value: float) -> None:
+        registry._set_pref_float("wake_word_sensitivity", max(0.0, min(1.0, value)))
+
+    entities.append(
+        NumberEntity(
+            server=registry.server,
+            key=get_entity_key("wake_word_sensitivity"),
+            name="Wake Word Sensitivity",
+            object_id="wake_word_sensitivity",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            icon="mdi:account-voice",
+            mode=2,
+            entity_category=1,
+            value_getter=get_wake_word_sensitivity,
+            value_setter=set_wake_word_sensitivity,
+        )
+    )
+
+    def get_stop_word_sensitivity() -> float:
+        return float(registry._get_pref_float("stop_word_sensitivity", 0.7))
+
+    def set_stop_word_sensitivity(value: float) -> None:
+        registry._set_pref_float("stop_word_sensitivity", max(0.0, min(1.0, value)))
+
+    entities.append(
+        NumberEntity(
+            server=registry.server,
+            key=get_entity_key("stop_word_sensitivity"),
+            name="Stop Word Sensitivity",
+            object_id="stop_word_sensitivity",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            icon="mdi:stop-circle",
+            mode=2,
+            entity_category=1,
+            value_getter=get_stop_word_sensitivity,
+            value_setter=set_stop_word_sensitivity,
         )
     )
     _LOGGER.debug("Behavior entities registered")

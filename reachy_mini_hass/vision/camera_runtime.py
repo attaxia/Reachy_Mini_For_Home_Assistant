@@ -13,20 +13,6 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
-def load_head_tracker(server: "MJPEGCameraServer") -> bool:
-    try:
-        from .head_tracker import HeadTracker
-
-        server._head_tracker = HeadTracker(confidence_threshold=server._face_confidence_threshold)
-        server._face_tracking_enabled = True
-        return True
-    except Exception as e:
-        _LOGGER.warning("Failed to load head tracker: %s", e)
-        server._head_tracker = None
-        server._face_tracking_enabled = False
-        return False
-
-
 def load_gesture_detector(server: "MJPEGCameraServer") -> bool:
     try:
         from .gesture_detector import GestureDetector
@@ -60,27 +46,13 @@ async def start(server: "MJPEGCameraServer") -> None:
         backend = server.reachy_mini.media.backend
         backend_name = {
             MediaBackend.NO_MEDIA: "No Media",
-            MediaBackend.GSTREAMER: "GStreamer",
-            MediaBackend.GSTREAMER_NO_VIDEO: "GStreamer (No Video)",
-            MediaBackend.DEFAULT: "Default",
-            MediaBackend.DEFAULT_NO_VIDEO: "Default (No Video)",
-            MediaBackend.SOUNDDEVICE_OPENCV: "SoundDevice + OpenCV",
-            MediaBackend.SOUNDDEVICE_NO_VIDEO: "SoundDevice (No Video)",
+            MediaBackend.LOCAL: "Local (GStreamer)",
             MediaBackend.WEBRTC: "WebRTC",
+            MediaBackend.DEFAULT: "Default",
         }.get(backend, str(backend))
         _LOGGER.info("Detected media backend: %s", backend_name)
-    except ImportError:
-        _LOGGER.debug("MediaBackend enum not available")
     except Exception as e:
         _LOGGER.debug("Failed to detect media backend: %s", e)
-
-    if server._face_tracking_enabled:
-        if load_head_tracker(server):
-            _LOGGER.info(
-                "Face tracking enabled with YOLO head tracker (confidence=%.2f)", server._face_confidence_threshold
-            )
-    else:
-        _LOGGER.info("Face tracking disabled by configuration")
 
     if server._gesture_detection_enabled:
         if load_gesture_detector(server):
@@ -112,8 +84,6 @@ async def stop(server: "MJPEGCameraServer", join_timeout: float = 3.0) -> None:
     with server._frame_lock:
         server._last_frame = None
         server._last_frame_time = 0
-    with server._face_tracking_lock:
-        server._face_tracking_offsets = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     with server._gesture_lock:
         server._current_gesture = "none"
         server._gesture_confidence = 0.0
@@ -123,14 +93,6 @@ async def stop(server: "MJPEGCameraServer", join_timeout: float = 3.0) -> None:
 
 
 def release_ml_models(server: "MJPEGCameraServer") -> None:
-    if server._head_tracker is not None:
-        try:
-            if hasattr(server._head_tracker, "close"):
-                server._head_tracker.close()
-            server._head_tracker = None
-            _LOGGER.debug("Head tracker model released")
-        except Exception as e:
-            _LOGGER.warning("Error releasing head tracker: %s", e)
     if server._gesture_detector is not None:
         try:
             if hasattr(server._gesture_detector, "close"):
@@ -144,11 +106,8 @@ def release_ml_models(server: "MJPEGCameraServer") -> None:
 def suspend_processing(server: "MJPEGCameraServer") -> None:
     _LOGGER.info("Suspending camera processing resources...")
     server._frame_rate_manager.suspend()
-    server._face_tracking_enabled = False
     server._gesture_detection_enabled = False
     release_ml_models(server)
-    with server._face_tracking_lock:
-        server._face_tracking_offsets = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     with server._gesture_lock:
         server._current_gesture = "none"
         server._gesture_confidence = 0.0
@@ -158,18 +117,15 @@ def suspend_processing(server: "MJPEGCameraServer") -> None:
 
 def resume_processing(server: "MJPEGCameraServer") -> None:
     _LOGGER.info("Resuming camera processing resources...")
-    if server._face_tracking_requested or server._gesture_detection_requested:
+    if server._gesture_detection_requested:
         server._frame_rate_manager.resume()
-    if server._face_tracking_requested and server._head_tracker is None:
-        if load_head_tracker(server):
-            _LOGGER.info("Head tracker model reloaded (confidence=%.2f)", server._face_confidence_threshold)
-    else:
-        server._face_tracking_enabled = server._face_tracking_requested and server._head_tracker is not None
     if server._gesture_detection_requested and server._gesture_detector is None:
         if load_gesture_detector(server):
             _LOGGER.info("Gesture detector model reloaded")
     else:
-        server._gesture_detection_enabled = server._gesture_detection_requested and server._gesture_detector is not None
+        server._gesture_detection_enabled = (
+            server._gesture_detection_requested and server._gesture_detector is not None
+        )
     _LOGGER.info("Camera processing resumed - full functionality restored")
     log_vision_runtime_state(server, "Resumed")
 
@@ -177,11 +133,9 @@ def resume_processing(server: "MJPEGCameraServer") -> None:
 def apply_runtime_vision_state(
     server: "MJPEGCameraServer",
     *,
-    face_requested: bool,
     gesture_requested: bool,
     models_allowed: bool,
 ) -> None:
-    server._face_tracking_requested = bool(face_requested)
     server._gesture_detection_requested = bool(gesture_requested)
 
     if not models_allowed:
@@ -221,10 +175,8 @@ def resume_from_suspend(server: "MJPEGCameraServer") -> None:
 
 def log_vision_runtime_state(server: "MJPEGCameraServer", source: str) -> None:
     _LOGGER.info(
-        "%s vision state: face requested=%s active=%s, gesture requested=%s active=%s",
+        "%s vision state: gesture requested=%s active=%s",
         source,
-        server._face_tracking_requested,
-        server._face_tracking_enabled,
         server._gesture_detection_requested,
         server._gesture_detection_enabled,
     )

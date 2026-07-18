@@ -98,11 +98,6 @@ class EmotionMove:
         """Duration of the emotion in seconds."""
         return float(self._emotion_move.duration)
 
-    @property
-    def sound_path(self):
-        """Path to the bundled `.wav` for this emotion, or None if absent."""
-        return getattr(self._emotion_move, "sound_path", None)
-
     def evaluate(self, t: float) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
         """Evaluate emotion pose at time t.
 

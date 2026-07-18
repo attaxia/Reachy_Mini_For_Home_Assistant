@@ -23,7 +23,6 @@ import time
 from collections import deque
 from pathlib import Path
 from queue import Queue
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -38,7 +37,6 @@ from .control_runtime import (
     issue_control_command,
     run_control_loop,
     update_emotion_move,
-    update_face_tracking,
 )
 from .emotion_moves import EmotionMove, is_emotion_available
 from .idle_runtime import (
@@ -74,7 +72,6 @@ DEFAULT_CONTROL_LOOP_FREQUENCY_HZ = 100
 MAX_CONTROL_DT_S = 0.05
 
 # Animation suppression when face detected
-FACE_DETECTED_THRESHOLD = 0.001  # Minimum offset magnitude to consider face detected
 ANIMATION_BLEND_DURATION = 0.18  # Seconds to blend animation back when face lost
 FACE_TRACKING_ANIMATION_BLEND = 0.35
 IDLE_ACTION_ANIMATION_BLEND_DURATION = 0.4  # Slightly longer fade avoids visible idle/action handoff steps
@@ -213,10 +210,10 @@ class MovementManager:
         self._idle_action_queue: deque[PendingAction] = deque()
         self._idle_action_animation_suppression = 0.0
 
-        # Face tracking offsets (from camera worker)
-        self._face_tracking_offsets: tuple[float, float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        self._face_tracking_lock = threading.Lock()
-
+        # Face detected state is updated by a dedicated sampling thread that
+        # calls ``reachy_mini.get_tracked_face()``. The boolean drives body_yaw
+        # smoothing, animation blend and DOA suppression; daemon-side head
+        # tracking produces the actual yaw/pitch offsets via IK blend.
         # Last sent pose for change detection (reduce daemon load)
         self._last_sent_head_pose: np.ndarray | None = None
         self._last_sent_antennas: tuple[float, float] | None = None
@@ -235,49 +232,16 @@ class MovementManager:
         self._body_yaw_smoothed: float | None = None
         self._last_body_yaw_update = 0.0
 
-        # Optional user-commanded body yaw override (radians) coming from
-        # the HA "Body Yaw" entity / ReachyController.set_body_yaw. When
-        # set, compose_final_pose uses this value instead of the
-        # auto-derived (head-yaw-coupled) value, so the body stays where
-        # the user put it. Cleared automatically when the robot leaves
-        # IDLE (voice phases / face tracking should re-couple head and
-        # body) or when the user explicitly resets it.
-        self._user_body_yaw_override: float | None = None
-
-        # Camera server reference for face tracking
+        # Camera server reference for gesture state streaming (no face tracking)
         self._camera_server = None
-
-        # Face tracking smoothing - DISABLED to match reference project
-        # Reference project applies face tracking offsets directly without smoothing
-        # Smoothing causes "lag" and "trailing" that looks unnatural
-        # Only smooth interpolation when face is lost (handled in camera_server.py)
-        self._smoothed_face_offsets: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        # self._face_smoothing_factor = 0.3  # DISABLED - direct application instead
 
         # Emotion move playback state
         self._emotion_move: EmotionMove | None = None
         self._emotion_start_time: float = 0.0
         self._emotion_move_lock = threading.Lock()
-
-        # Deep sleep state tracking + publish callback. The HA "Deep Sleep"
-        # switch wants to reflect the *actual* runtime state of the robot,
-        # not just the configured preference: when an emotion temporarily
-        # lifts the head, the toggle should flip OFF, then back ON when the
-        # head settles back into rest. The control loop watches
-        # `is_in_deep_sleep_state()` for changes and calls this callback so
-        # the entity can push the new state to HA.
-        # `_at_deep_sleep_pose` is the durable "the head has reached the
-        # rest pose" latch. It flips True only when the `idle_rest` action
-        # completes; it flips False whenever any new action starts, an
-        # emotion starts, or the robot leaves IDLE state. Without this
-        # latch, briefly using `_pending_action is None` as a proxy made
-        # the toggle flap rapidly during the gap between successive
-        # actions (e.g., lift_for_emotion completes -> idle_rest queued
-        # but not yet started -> wide-open one-tick window where every
-        # condition would say "at rest" even though the head is mid-flight).
-        self._deep_sleep_state_callback: Callable[[], None] | None = None
-        self._last_published_deep_sleep_state: bool | None = None
-        self._at_deep_sleep_pose: bool = False
+        # Optional callback fired (from the control loop) when an emotion move
+        # finishes — used by the protocol layer to restore head-tracking weight.
+        self._on_emotion_complete_callback = None
 
         # DOA (Direction of Arrival) sound tracking
         self._doa_tracker = DOATracker(
@@ -482,40 +446,12 @@ class MovementManager:
         emotion poses in the control loop, which avoids conflicts with
         set_target() calls that would cause "a move is currently running" warnings.
 
-        If the robot is currently parked at the deep sleep rest pose
-        (idle_behavior disabled and state == IDLE), this method first
-        smoothly lifts the head to neutral over 0.6s via a PendingAction,
-        and uses the action's completion callback to queue the actual
-        emotion. The lift is required because the deep sleep pose sits at
-        the edge of the Stewart platform's reachable workspace; the
-        daemon's IK rejects emotion poses if we try to transition directly
-        from there ("Collision detected or head pose not achievable!").
-
         Args:
             emotion_name: Name of the emotion (e.g., "happy1", "sad1")
 
         Returns:
             True if emotion was queued successfully, False otherwise
         """
-        if self.state.robot_state == RobotState.IDLE and not self._idle_behavior_enabled():
-            def _emotion_after_lift() -> None:
-                self._enqueue_command("emotion_move", emotion_name, "emotion_after_lift")
-
-            lift_action = PendingAction(
-                name="lift_for_emotion",
-                target_pitch=0.0,
-                target_yaw=0.0,
-                target_roll=0.0,
-                target_x=0.0,
-                target_y=0.0,
-                target_z=0.0,
-                target_antenna_left=0.0,
-                target_antenna_right=0.0,
-                duration=0.6,
-                callback=_emotion_after_lift,
-            )
-            return self._enqueue_command("action", lift_action, "lift_for_emotion")
-
         return self._enqueue_command("emotion_move", emotion_name, "emotion_move")
 
     def queue_action(self, action: PendingAction) -> None:
@@ -538,18 +474,6 @@ class MovementManager:
     def shake(self, amplitude_deg: float = 20, duration: float = 0.5) -> None:
         """Thread-safe: Perform a head shake gesture."""
         self._enqueue_command("shake", (amplitude_deg, duration), "shake")
-
-    def set_speech_sway(self, x: float, y: float, z: float, roll: float, pitch: float, yaw: float) -> None:
-        """Thread-safe: Set speech-driven sway offsets.
-
-        These offsets are applied on top of the current animation
-        to create audio-synchronized head motion during TTS playback.
-
-        Args:
-            x, y, z: Position offsets in meters
-            roll, pitch, yaw: Orientation offsets in radians
-        """
-        self._enqueue_command("speech_sway", (x, y, z, roll, pitch, yaw), "speech_sway")
 
     def reset_to_neutral(self, duration: float = 0.5) -> None:
         """Thread-safe: Reset to neutral position."""
@@ -584,61 +508,8 @@ class MovementManager:
         self._enqueue_command("action", action, "idle_rest", timeout=0)
 
     def set_camera_server(self, camera_server) -> None:
-        """Set the camera server for face tracking offsets.
-
-        Args:
-            camera_server: MJPEGCameraServer instance with face tracking
-        """
+        """Set the camera server reference (gesture state streaming only)."""
         self._camera_server = camera_server
-        logger.info("Camera server set for face tracking")
-
-    def is_in_deep_sleep_state(self) -> bool:
-        """True when the robot is currently parked at the deep sleep rest pose.
-
-        Reflects *runtime* state, not just the configured preference. Returns
-        True only when ALL of these hold:
-
-          - Configured for deep sleep mode (idle_behavior off).
-          - Robot is in IDLE (not LISTENING/THINKING/SPEAKING).
-          - No emotion is currently playing.
-          - The `_at_deep_sleep_pose` latch is set, meaning the most recent
-            head-affecting transition was a successful `idle_rest` action
-            settling into the rest pose. The latch is reset at every
-            outgoing transition (any new action starts, emotion starts,
-            state leaves IDLE) so the predicate doesn't briefly flicker
-            True during the one-tick gaps between successive actions.
-        """
-        if self._idle_behavior_enabled():
-            return False
-        if self.state.robot_state != RobotState.IDLE:
-            return False
-        if self.is_emotion_playing():
-            return False
-        return self._at_deep_sleep_pose
-
-    def set_deep_sleep_state_callback(self, callback: Callable[[], None] | None) -> None:
-        """Register a no-arg callback invoked whenever `is_in_deep_sleep_state`
-        flips. The control loop calls this so the HA "Deep Sleep" switch
-        entity can push its new state to Home Assistant in real time.
-
-        Pass `None` to detach.
-        """
-        self._deep_sleep_state_callback = callback
-        # Reset so the next loop iteration unconditionally publishes once.
-        self._last_published_deep_sleep_state = None
-
-    def set_user_body_yaw(self, body_yaw_rad: float | None) -> None:
-        """Set or clear the user's manual body-yaw override (radians).
-
-        When set, compose_final_pose() uses this value as the target body
-        yaw on every control-loop iteration, so the body stays where the
-        user put it instead of being snapped back by the auto-derivation
-        (which couples body yaw to head yaw and resets to 0 when idle
-        with no face detected).
-
-        Pass `None` to release the override and return to auto mode.
-        """
-        self._user_body_yaw_override = body_yaw_rad
 
     # =========================================================================
     # DOA (Direction of Arrival) Sound Tracking API
@@ -734,14 +605,14 @@ class MovementManager:
         except Exception:
             logger.warning("Command queue full, dropping doa_turn command")
 
-    def set_face_tracking_offsets(self, offsets: tuple[float, float, float, float, float, float]) -> None:
-        """Thread-safe: Update face tracking offsets manually.
+    def set_face_detected(self, detected: bool) -> None:
+        """Thread-safe: Update face detection flag from the tracking sampler.
 
-        Args:
-            offsets: Tuple of (x, y, z, roll, pitch, yaw) in meters/radians
+        The SDK daemon-side head tracker owns the head pose; our control loop
+        only consumes the ``detected`` boolean for body_yaw smoothing,
+        animation blend and DOA suppression.
         """
-        with self._face_tracking_lock:
-            self._face_tracking_offsets = offsets
+        self.state.face_detected = bool(detected)
 
     def set_target_pose(
         self,
@@ -927,12 +798,6 @@ class MovementManager:
 
             self._pending_action = None
 
-            # The idle_rest action is the only one that lands us at the
-            # deep sleep pose. Latch True here so is_in_deep_sleep_state()
-            # can return True until something else moves the head.
-            if completed_action.name == "idle_rest":
-                self._at_deep_sleep_pose = True
-
             # Keep idle action state active until the full idle action queue is drained
             if completed_action.name.startswith("idle_action") and self._idle_action_queue:
                 self._start_action(self._idle_action_queue.popleft())
@@ -1027,9 +892,6 @@ class MovementManager:
         else:
             self.state.animation_blend = max(target_blend, current_blend - step)
 
-    def _update_face_tracking(self) -> None:
-        update_face_tracking(self, FACE_DETECTED_THRESHOLD)
-
     def _update_idle_look_around(self) -> None:
         update_idle_look_around(
             self,
@@ -1075,7 +937,7 @@ class MovementManager:
     # =========================================================================
 
     def _control_loop(self) -> None:
-        run_control_loop(self, max_control_dt_s=MAX_CONTROL_DT_S, face_detected_threshold=FACE_DETECTED_THRESHOLD)
+        run_control_loop(self, max_control_dt_s=MAX_CONTROL_DT_S)
 
     # =========================================================================
     # Lifecycle
@@ -1150,12 +1012,13 @@ class MovementManager:
     def _reset_to_neutral_blocking(self) -> None:
         """Reset robot to neutral position (blocking)."""
         try:
-            neutral_pose = np.eye(4)
+            from reachy_mini.reachy_mini import INIT_HEAD_POSE, INIT_ANTENNAS_JOINT_POSITIONS
+
             self.robot.goto_target(
-                head=neutral_pose,
-                antennas=[0.0, 0.0],
+                head=INIT_HEAD_POSE,
+                antennas=INIT_ANTENNAS_JOINT_POSITIONS,
                 body_yaw=0.0,
-                duration=0.3,  # Faster reset
+                duration=0.3,
             )
             logger.info("Robot reset to neutral position")
         except Exception as e:

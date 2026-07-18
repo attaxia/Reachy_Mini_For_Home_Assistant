@@ -31,29 +31,9 @@ def apply_idle_behavior_enabled(manager: "MovementManager", enabled: bool) -> No
             transition_or_apply_idle_rest_pose(manager)
     elif manager.state.robot_state == RobotState.IDLE:
         manager._animation_player.set_animation("idle")
-        # Smoothly raise the head out of the deep sleep rest pose into
-        # the active idle pose. The previous code zeroed only `target_pitch`
-        # and the antennas, leaving `target_x/y/z/roll` at their deep sleep
-        # values (Z=-0.044m, x=-0.021m, etc.) — so the head's pitch came
-        # up to level but the platform stayed lowered, producing the
-        # "breathing while still lowered" symptom.
-        manager._enqueue_command(
-            "action",
-            PendingAction(
-                name="active_idle_lift",
-                target_pitch=0.0,
-                target_yaw=manager.state.target_yaw,  # preserve pose anchor yaw
-                target_roll=0.0,
-                target_x=0.0,
-                target_y=0.0,
-                target_z=0.0,
-                target_antenna_left=0.0,
-                target_antenna_right=0.0,
-                duration=2.0,
-            ),
-            "active_idle_lift",
-            timeout=0,
-        )
+        manager.state.target_pitch = 0.0
+        manager.state.target_antenna_left = 0.0
+        manager.state.target_antenna_right = 0.0
 
     logger.info("Idle behavior %s", "enabled" if enabled else "disabled")
 

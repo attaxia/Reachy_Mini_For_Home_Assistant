@@ -3,7 +3,6 @@
 import importlib.metadata
 import logging
 import threading
-import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Optional
 
@@ -48,6 +47,7 @@ from .motion_bridge import (
     turn_to_sound_source,
 )
 from .session_flow import (
+    cancel_delayed_continue_conversation,
     cancel_delayed_idle_return,
     clear_conversation,
     get_or_create_conversation_id,
@@ -114,6 +114,7 @@ class VoiceSatelliteProtocol(APIServer):
         # Track Home Assistant entity states for change detection
         self._ha_entity_states: dict[str, str] = {}
         self._idle_return_timer: threading.Timer | None = None
+        self._continue_conversation_timer: threading.Timer | None = None
         self._pipeline_active = False
 
         # Initialize Reachy controller
@@ -123,21 +124,32 @@ class VoiceSatelliteProtocol(APIServer):
         if state.motion is not None and state.motion.movement_manager is not None:
             self.reachy_controller.set_movement_manager(state.motion.movement_manager)
 
-            # Setup speech sway callback for audio-driven head motion
-            def sway_callback(sway: dict) -> None:
-                mm = state.motion.movement_manager
-                if mm is not None:
-                    mm.set_speech_sway(
-                        sway.get("x_m", 0.0),
-                        sway.get("y_m", 0.0),
-                        sway.get("z_m", 0.0),
-                        sway.get("roll_rad", 0.0),
-                        sway.get("pitch_rad", 0.0),
-                        sway.get("yaw_rad", 0.0),
-                    )
+            # Wire emotion-move completion to restore head-tracking weight after
+            # the emotion pose is no longer overriding the daemon-side tracker.
+            def on_emotion_complete(_emotion_name: str) -> None:
+                from .motion_bridge import _restore_head_tracking_after_emotion
 
-            state.tts_player.set_sway_callback(sway_callback)
-            _LOGGER.info("Speech sway callback configured for TTS player")
+                _restore_head_tracking_after_emotion(self)
+
+            state.motion.movement_manager._on_emotion_complete_callback = on_emotion_complete
+
+            # Setup SDK-driven head wobbling via the public ReachyMini API.
+            # enable_wobbling() starts the local GStreamer analyser AND tells
+            # the daemon to compose sway offsets into its IK output, so the
+            # app does not need to feed offsets back through set_target.
+            try:
+                state.reachy_mini.enable_wobbling()
+                _LOGGER.info("SDK head wobbler enabled (daemon-side composition)")
+            except Exception:
+                _LOGGER.warning("SDK head wobbling unavailable; head motion during TTS disabled", exc_info=True)
+
+        # Daemon-side face tracking: create the tracker worker paused (weight=0)
+        # until a voice phase (or idle) requests a non-zero weight. A background
+        # thread samples the SDK's 1Hz DaemonStatus broadcast to update
+        # MovementManager.state.face_detected and push state changes to HA.
+        self._face_target_thread: threading.Thread | None = None
+        self._face_target_stop = threading.Event()
+        self._init_daemon_head_tracking(state)
 
         # Initialize entity registry
         self._entity_registry = create_entity_registry(self)
@@ -164,6 +176,52 @@ class VoiceSatelliteProtocol(APIServer):
         # DISABLED: Emotion detection moved to Home Assistant blueprint
         # self._emotion_detector = EmotionKeywordDetector(play_emotion_callback=self._play_emotion)
         _LOGGER.info("VoiceSatelliteProtocol.__init__ completed")
+
+    def _init_daemon_head_tracking(self, state: "ServerState") -> None:
+        """Start the daemon-side head tracker (paused) and a status sampler.
+
+        The SDK's ``start_head_tracking`` is idempotent: calling it once with
+        ``weight=0`` creates the YuNet worker on the daemon in a paused state,
+        keeping it warm so subsequent weight updates take effect immediately.
+        A daemon thread then waits for each 1Hz ``DaemonStatus`` broadcast and
+        copies ``face_target.detected`` into ``MovementManager.state.face_detected``,
+        also notifying the entity registry when the boolean flips so the HA
+        binary sensor updates.
+        """
+        reachy_mini = state.reachy_mini
+        if reachy_mini is None:
+            return
+        try:
+            reachy_mini.start_head_tracking(0.0)
+            _LOGGER.info("Daemon-side head tracker initialized (paused)")
+        except Exception:
+            _LOGGER.warning("Daemon-side head tracking unavailable", exc_info=True)
+            return
+
+        mm = state.motion.movement_manager if state.motion is not None else None
+        if mm is None:
+            return
+
+        def _poll_loop() -> None:
+            last_detected: bool | None = None
+            while not self._face_target_stop.is_set():
+                try:
+                    face = reachy_mini.get_tracked_face(wait=True, timeout=2.0)
+                    detected = bool(face.detected)
+                except Exception:
+                    detected = False
+                mm.set_face_detected(detected)
+                if detected != last_detected:
+                    last_detected = detected
+                    try:
+                        self._entity_registry.update_face_detected_state()
+                    except Exception:
+                        pass
+
+        self._face_target_thread = threading.Thread(
+            target=_poll_loop, daemon=True, name="face-target-poller"
+        )
+        self._face_target_thread.start()
 
     def set_ha_connection_callbacks(self, on_connected, on_disconnected):
         """Set callbacks for Home Assistant connection/disconnection."""
@@ -281,6 +339,7 @@ class VoiceSatelliteProtocol(APIServer):
 
     def _cancel_delayed_idle_return(self) -> None:
         cancel_delayed_idle_return(self)
+        cancel_delayed_continue_conversation(self)
 
     def _schedule_delayed_idle_return(self) -> None:
         schedule_delayed_idle_return(self, IDLE_RETURN_DELAY_S)
@@ -310,6 +369,8 @@ class VoiceSatelliteProtocol(APIServer):
         super().connection_lost(exc)
         _LOGGER.info("Disconnected from Home Assistant")
         self._cancel_delayed_idle_return()
+        # Stop the face-target status sampler
+        self._face_target_stop.set()
         # Clear streaming state on disconnect
         self._is_streaming_audio = False
         self._pipeline_active = False
@@ -320,6 +381,12 @@ class VoiceSatelliteProtocol(APIServer):
         self._timer_finished = False
         self._timer_ring_start = None
         self._set_stop_word_active(False)
+
+        # Stop any active playback so audio doesn't leak after HA disconnects
+        if self.state.music_player:
+            self.state.music_player.stop()
+        if self.state.tts_player:
+            self.state.tts_player.stop()
 
         run_ha_disconnected_callback(self)
 

@@ -76,6 +76,16 @@ class ESPHomeConfig:
 
 
 @dataclass
+class VoiceConfig:
+    """Configuration for voice conversation flow."""
+
+    # Delay after TTS finishes before re-opening the mic during continuous
+    # conversation. Prevents the mic from capturing the tail end of the
+    # assistant's own TTS playback and self-triggering wake word detection.
+    continue_conversation_settle_delay: float = 0.5  # seconds
+
+
+@dataclass
 class CameraConfig:
     """Configuration for camera and video streaming."""
 
@@ -83,22 +93,10 @@ class CameraConfig:
     port: int = 8081
 
     # Frame capture
-    fps_high: int = 15  # Active mode: smooth face tracking
-    fps_low: int = 10  # Low power: periodic face check
-    fps_idle: float = 5  # Ultra-low power: minimal CPU
+    fps_high: int = 15  # MJPEG stream target FPS
 
     # JPEG encoding
     quality: int = 80
-
-    # Face tracking runtime tuning
-    face_confidence_threshold: float = 0.5  # Min confidence for face detection (0.3 too low, causes false positives)
-    face_lost_delay: float = 2.0  # Wait before returning to neutral
-    interpolation_duration: float = 1.0  # Time to return to neutral
-    offset_scale: float = 0.6  # Face offset multiplier
-
-    # Power management
-    low_power_threshold: float = 5.0  # Seconds without face -> low power
-    idle_threshold: float = 30.0  # Seconds without face -> idle
 
     # Gesture detection runtime tuning
     gesture_detection_interval: int = 1  # Run every frame for maximum gesture responsiveness
@@ -214,6 +212,7 @@ class Config:
     # Subsystem configurations
     daemon: DaemonConfig = DaemonConfig()
     esphome: ESPHomeConfig = ESPHomeConfig()
+    voice: VoiceConfig = VoiceConfig()
     camera: CameraConfig = CameraConfig()
     motion: MotionConfig = MotionConfig()
     audio: AudioConfig = AudioConfig()
@@ -278,6 +277,11 @@ class Config:
         cls.esphome.port = _env_int("REACHY_ESPHOME_PORT", cls.esphome.port)
         cls.esphome.device_name = os.environ.get("REACHY_ESPHOME_DEVICE_NAME", cls.esphome.device_name)
 
+        # Voice
+        cls.voice.continue_conversation_settle_delay = _env_float(
+            "REACHY_VOICE_CONTINUE_CONVERSATION_SETTLE_DELAY", cls.voice.continue_conversation_settle_delay
+        )
+
         # Camera
         cls.camera.port = _env_int("REACHY_CAMERA_PORT", cls.camera.port)
 
@@ -326,6 +330,11 @@ class Config:
             for key, value in data["esphome"].items():
                 if hasattr(cls.esphome, key):
                     setattr(cls.esphome, key, value)
+
+        if "voice" in data:
+            for key, value in data["voice"].items():
+                if hasattr(cls.voice, key):
+                    setattr(cls.voice, key, value)
 
         if "camera" in data:
             for key, value in data["camera"].items():
@@ -394,6 +403,9 @@ class Config:
                 "port": cls.esphome.port,
                 "device_name": cls.esphome.device_name,
                 "friendly_name": cls.esphome.friendly_name,
+            },
+            "voice": {
+                "continue_conversation_settle_delay": cls.voice.continue_conversation_settle_delay,
             },
             "camera": {
                 "port": cls.camera.port,

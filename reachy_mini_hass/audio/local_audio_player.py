@@ -1,7 +1,6 @@
-"""Local-only audio player for TTS and announcements."""
-
 from __future__ import annotations
 
+import logging
 import threading
 from typing import TYPE_CHECKING
 
@@ -10,9 +9,16 @@ from .audio_player_playback import AudioPlayerPlaybackMixin
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class LocalAudioPlayer(AudioPlayerPlaybackMixin):
-    """Audio player for local/TTS playback without Sendspin runtime state."""
+    """Local audio player for TTS playback via SDK media pipeline.
+
+    Head wobbling is handled by the SDK's HeadWobbler which is registered
+    by VoiceAssistantService via media.enable_wobbling(). Audio played
+    through this player flows through the GStreamer tee automatically.
+    """
 
     def __init__(self, reachy_mini=None, gstreamer_lock=None) -> None:
         self.reachy_mini = reachy_mini
@@ -26,11 +32,7 @@ class LocalAudioPlayer(AudioPlayerPlaybackMixin):
         self._current_volume: float = 1.0
         self._stop_flag = threading.Event()
         self._playback_thread: threading.Thread | None = None
-        self._sway_callback: Callable[[dict], None] | None = None
         self._http_host_override: str | None = None
-
-    def set_sway_callback(self, callback: Callable[[dict], None] | None) -> None:
-        self._sway_callback = callback
 
     def set_reachy_mini(self, reachy_mini) -> None:
         self.reachy_mini = reachy_mini
