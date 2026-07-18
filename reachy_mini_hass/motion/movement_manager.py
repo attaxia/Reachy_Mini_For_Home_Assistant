@@ -91,14 +91,6 @@ def _smootherstep(value: float) -> float:
     return clamped * clamped * clamped * (clamped * (clamped * 6.0 - 15.0) + 10.0)
 
 
-# Pose epsilon constants are kept for compatibility with existing motion logic.
-POSE_EPS = 1e-3  # Max element delta in 4x4 pose matrix
-ANTENNA_EPS = 0.005  # Radians (~0.29 deg)
-BODY_YAW_EPS = 0.005  # Radians (~0.29 deg)
-IDLE_POSE_EPS = 0.0018  # Slightly relaxed pose deadband in quiet idle
-IDLE_BODY_YAW_EPS = 0.01  # Slightly relaxed body yaw deadband in quiet idle
-IDLE_ANTENNA_EPS = 0.012  # Larger idle antenna deadband to reduce tiny updates
-
 # Idle look-around behavior parameters
 IDLE_LOOK_AROUND_MIN_INTERVAL = 6.0  # Minimum seconds between look-arounds
 IDLE_LOOK_AROUND_MAX_INTERVAL = 14.0  # Maximum seconds between look-arounds
@@ -194,6 +186,9 @@ class MovementManager:
 
         # Connection health tracking
         self._connection_lost = False
+        self._connection_lost_since = 0.0
+        self._ws_rebuild_thread: threading.Thread | None = None
+        self._last_ws_rebuild_attempt = 0.0
         self._last_successful_command = self._now()
         self._connection_timeout = 3.0
         self._reconnect_backoff_initial = max(0.2, float(Config.motion.reconnect_backoff_initial_s))

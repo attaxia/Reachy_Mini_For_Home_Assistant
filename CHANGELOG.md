@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Motion freeze after wake word / repeated emotions** — Re-apply the `max_send_rate_hz` cap (15 Hz) on `set_target` sends, originally added in `ae13179` and lost in later reverts/rebases. Uncapped 100 Hz sends starve the daemon's outbound publishes under combined audio + motion load, tripping the SDK WSClient's 1 s heartbeat so every subsequent `set_target` raises "Lost connection" while audio (separate transport) keeps working
+- **Motion never recovering after a WebSocket closure** — The SDK's `WSClient` never re-opens its socket, so retrying `set_target` on a dead client could not recover an actual closure. After 10 s of persistent connection loss the movement manager now rebuilds the WebSocket client on a background thread, swaps it into `robot.client`, re-asserts automatic body yaw, and re-enables motor torque (per-motor watchdogs drop torque during an outage — the `6367aa9` finding)
+
+### Changed
+- **Redundant `set_target` suppression** — Skip sends when the composed pose is within deadband of the last sent pose, with a 1 s keepalive so a parked robot (deep sleep) still exercises the command path; the previously unused `POSE_EPS`/`ANTENNA_EPS`/`BODY_YAW_EPS` constants now live in `control_runtime.py` and are actually enforced
+
 ## [1.0.8] - 2026-07-11
 
 ### Added
