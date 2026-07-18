@@ -23,6 +23,7 @@ import time
 from collections import deque
 from pathlib import Path
 from queue import Queue
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -243,6 +244,26 @@ class MovementManager:
         # finishes — used by the protocol layer to restore head-tracking weight.
         self._on_emotion_complete_callback = None
 
+        # Deep sleep state tracking + publish callback. The HA "Deep Sleep"
+        # switch wants to reflect the *actual* runtime state of the robot,
+        # not just the configured preference: when an emotion temporarily
+        # lifts the head, the toggle should flip OFF, then back ON when the
+        # head settles back into rest. The control loop watches
+        # `is_in_deep_sleep_state()` for changes and calls this callback so
+        # the entity can push the new state to HA.
+        # `_at_deep_sleep_pose` is the durable "the head has reached the
+        # rest pose" latch. It flips True only when the `idle_rest` action
+        # completes; it flips False whenever any new action starts, an
+        # emotion starts, or the robot leaves IDLE state. Without this
+        # latch, briefly using `_pending_action is None` as a proxy made
+        # the toggle flap rapidly during the gap between successive
+        # actions (e.g., lift_for_emotion completes -> idle_rest queued
+        # but not yet started -> wide-open one-tick window where every
+        # condition would say "at rest" even though the head is mid-flight).
+        self._deep_sleep_state_callback: Callable[[], None] | None = None
+        self._last_published_deep_sleep_state: bool | None = None
+        self._at_deep_sleep_pose: bool = False
+
         # DOA (Direction of Arrival) sound tracking
         self._doa_tracker = DOATracker(
             movement_callback=self._on_doa_turn,
@@ -446,12 +467,40 @@ class MovementManager:
         emotion poses in the control loop, which avoids conflicts with
         set_target() calls that would cause "a move is currently running" warnings.
 
+        If the robot is currently parked at the deep sleep rest pose
+        (idle_behavior disabled and state == IDLE), this method first
+        smoothly lifts the head to neutral over 0.6s via a PendingAction,
+        and uses the action's completion callback to queue the actual
+        emotion. The lift is required because the deep sleep pose sits at
+        the edge of the Stewart platform's reachable workspace; the
+        daemon's IK rejects emotion poses if we try to transition directly
+        from there ("Collision detected or head pose not achievable!").
+
         Args:
             emotion_name: Name of the emotion (e.g., "happy1", "sad1")
 
         Returns:
             True if emotion was queued successfully, False otherwise
         """
+        if self.state.robot_state == RobotState.IDLE and not self._idle_behavior_enabled():
+            def _emotion_after_lift() -> None:
+                self._enqueue_command("emotion_move", emotion_name, "emotion_after_lift")
+
+            lift_action = PendingAction(
+                name="lift_for_emotion",
+                target_pitch=0.0,
+                target_yaw=0.0,
+                target_roll=0.0,
+                target_x=0.0,
+                target_y=0.0,
+                target_z=0.0,
+                target_antenna_left=0.0,
+                target_antenna_right=0.0,
+                duration=0.6,
+                callback=_emotion_after_lift,
+            )
+            return self._enqueue_command("action", lift_action, "lift_for_emotion")
+
         return self._enqueue_command("emotion_move", emotion_name, "emotion_move")
 
     def queue_action(self, action: PendingAction) -> None:
@@ -510,6 +559,41 @@ class MovementManager:
     def set_camera_server(self, camera_server) -> None:
         """Set the camera server reference (gesture state streaming only)."""
         self._camera_server = camera_server
+
+    def is_in_deep_sleep_state(self) -> bool:
+        """True when the robot is currently parked at the deep sleep rest pose.
+
+        Reflects *runtime* state, not just the configured preference. Returns
+        True only when ALL of these hold:
+
+          - Configured for deep sleep mode (idle_behavior off).
+          - Robot is in IDLE (not LISTENING/THINKING/SPEAKING).
+          - No emotion is currently playing.
+          - The `_at_deep_sleep_pose` latch is set, meaning the most recent
+            head-affecting transition was a successful `idle_rest` action
+            settling into the rest pose. The latch is reset at every
+            outgoing transition (any new action starts, emotion starts,
+            state leaves IDLE) so the predicate doesn't briefly flicker
+            True during the one-tick gaps between successive actions.
+        """
+        if self._idle_behavior_enabled():
+            return False
+        if self.state.robot_state != RobotState.IDLE:
+            return False
+        if self.is_emotion_playing():
+            return False
+        return self._at_deep_sleep_pose
+
+    def set_deep_sleep_state_callback(self, callback: Callable[[], None] | None) -> None:
+        """Register a no-arg callback invoked whenever `is_in_deep_sleep_state`
+        flips. The control loop calls this so the HA "Deep Sleep" switch
+        entity can push its new state to Home Assistant in real time.
+
+        Pass `None` to detach.
+        """
+        self._deep_sleep_state_callback = callback
+        # Reset so the next loop iteration unconditionally publishes once.
+        self._last_published_deep_sleep_state = None
 
     # =========================================================================
     # DOA (Direction of Arrival) Sound Tracking API
@@ -797,6 +881,12 @@ class MovementManager:
                     logger.error("Action callback error: %s", e)
 
             self._pending_action = None
+
+            # The idle_rest action is the only one that lands us at the
+            # deep sleep pose. Latch True here so is_in_deep_sleep_state()
+            # can return True until something else moves the head.
+            if completed_action.name == "idle_rest":
+                self._at_deep_sleep_pose = True
 
             # Keep idle action state active until the full idle action queue is drained
             if completed_action.name.startswith("idle_action") and self._idle_action_queue:

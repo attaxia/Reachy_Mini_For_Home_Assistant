@@ -55,6 +55,13 @@ def handle_command(manager: "MovementManager", cmd: str, payload: Any) -> None:
             manager._start_antenna_unfreeze()
             manager._idle_antenna_smoothed = None
             manager._last_idle_antenna_update = 0.0
+            # When listening/thinking/speaking ends and we're back in IDLE
+            # under deep sleep mode, smoothly lower the head back into the
+            # configured rest pose so the camera is occluded again.
+            if not manager._idle_behavior_enabled():
+                from .idle_runtime import transition_or_apply_idle_rest_pose
+
+                transition_or_apply_idle_rest_pose(manager, duration=2.0)
 
         if payload != RobotState.IDLE:
             # Preserve the current pose anchor during an active conversation.
@@ -73,6 +80,9 @@ def handle_command(manager: "MovementManager", cmd: str, payload: Any) -> None:
                 manager.state.target_antenna_right = 0.0
             manager._idle_antenna_smoothed = None
             manager._last_idle_antenna_update = 0.0
+            # Leaving IDLE means we are no longer at deep sleep — clear the
+            # latch so the HA Deep Sleep toggle reflects this.
+            manager._at_deep_sleep_pose = False
 
         logger.debug("State changed: %s -> %s, animation: %s", old_state.value, payload.value, animation_name)
         return
@@ -129,6 +139,11 @@ def start_emotion_move(manager: "MovementManager", emotion_name: str) -> None:
         with manager._emotion_move_lock:
             manager._emotion_move = emotion_move
             manager._emotion_start_time = manager._now()
+        # Emotion playback drives the head away from rest pose; reset the
+        # at-rest latch so the HA Deep Sleep toggle flips OFF immediately
+        # and stays OFF through the whole emotion + post-emotion rest
+        # transition.
+        manager._at_deep_sleep_pose = False
         logger.info("Started emotion move: %s (duration=%.2fs)", emotion_name, emotion_move.duration)
     except Exception as e:
         logger.error("Failed to start emotion '%s': %s", emotion_name, e)
@@ -137,6 +152,11 @@ def start_emotion_move(manager: "MovementManager", emotion_name: str) -> None:
 def start_action(manager: "MovementManager", action: PendingAction) -> None:
     manager._pending_action = action
     manager._action_start_time = manager._now()
+    # Any action moves the head away from (or toward) rest, so we are no
+    # longer parked at the deep sleep pose. The idle_rest action's
+    # completion in _update_action will latch this back to True if it
+    # was an idle_rest and it finishes successfully.
+    manager._at_deep_sleep_pose = False
     manager._action_start_pose = {
         "pitch": manager.state.target_pitch,
         "yaw": manager.state.target_yaw,

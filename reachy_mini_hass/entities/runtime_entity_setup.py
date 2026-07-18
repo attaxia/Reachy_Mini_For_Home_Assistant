@@ -124,6 +124,66 @@ def setup_runtime_entities(registry: "EntityRegistry", entities: list) -> None:
         )
     )
 
+    # Deep Sleep switch. Reflects the *runtime* state, not just the
+    # preference: while the head is being lifted for an emotion or while
+    # listening/speaking, the toggle shows OFF; once the robot settles
+    # back into the deep sleep rest pose it shows ON. Toggling the switch
+    # changes the configured idle mode (idle_behavior_enabled, inverted)
+    # so transitions kick in immediately.
+    def _movement_manager():
+        if registry.reachy_controller is None:
+            return None
+        return registry.reachy_controller._movement_manager
+
+    def get_deep_sleep() -> bool:
+        manager = _movement_manager()
+        if manager is not None:
+            return manager.is_in_deep_sleep_state()
+        # Fallback when MovementManager isn't reachable yet: use the
+        # configured preference so the switch at least reflects intent.
+        prefs = registry._get_preferences()
+        return not bool(prefs.idle_behavior_enabled) if prefs is not None else True
+
+    def set_deep_sleep(enabled: bool) -> None:
+        registry._set_idle_behavior_enabled(not enabled)
+
+    deep_sleep_entity = SwitchEntity(
+        server=registry.server,
+        key=get_entity_key("deep_sleep_mode"),
+        name="Deep Sleep",
+        object_id="deep_sleep_mode",
+        icon="mdi:bed",
+        entity_category=0,  # 0 = primary control (shows under Controls in HA)
+        value_getter=get_deep_sleep,
+        value_setter=set_deep_sleep,
+    )
+    entities.append(deep_sleep_entity)
+    registry._deep_sleep_switch_entity = deep_sleep_entity
+
+    # Wire the runtime state -> entity push path. ESPHome is push-based;
+    # without this, HA only sees state changes when the user clicks the
+    # toggle. MovementManager runs in its own thread, so we route the
+    # update through the voice assistant's asyncio loop with
+    # call_soon_threadsafe — asyncio transports are not thread-safe and
+    # send_messages() ultimately writes to one.
+    manager = _movement_manager()
+    if manager is not None:
+        def _publish_deep_sleep_state() -> None:
+            voice_assistant = getattr(registry.server, "_voice_assistant_service", None)
+            loop = getattr(voice_assistant, "_event_loop", None) if voice_assistant else None
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(deep_sleep_entity.update_state)
+            else:
+                # Bootstrap path before the asyncio loop is captured —
+                # rare; safe because we're still on whatever thread
+                # spawned the manager.
+                try:
+                    deep_sleep_entity.update_state()
+                except Exception:
+                    _LOGGER.debug("deep_sleep_entity.update_state() failed", exc_info=True)
+
+        manager.set_deep_sleep_state_callback(_publish_deep_sleep_state)
+
     def sync_sendspin() -> None:
         registry.server._voice_assistant_service.set_sendspin_enabled(registry._get_pref_bool("sendspin_enabled"))
 
