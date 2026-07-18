@@ -109,9 +109,17 @@ def compose_final_pose(manager: "MovementManager") -> tuple[np.ndarray, tuple[fl
         manager._last_idle_antenna_update = 0.0
 
     final_head_yaw = extract_yaw_from_pose(final_head)
-    target_body_yaw = clamp_body_yaw(final_head_yaw)
-    if manager.state.robot_state == RobotState.IDLE and not manager.state.face_detected:
-        target_body_yaw = 0.0
+    if manager._user_body_yaw_override is not None:
+        # User has manually set body yaw via the HA entity. Honor it
+        # persistently instead of letting the auto-derivation (head-yaw
+        # coupling + idle-with-no-face zero) overwrite it on every tick.
+        # The override is cleared on transition out of IDLE (so voice
+        # phases / face tracking re-couple body to head naturally).
+        target_body_yaw = clamp_body_yaw(manager._user_body_yaw_override)
+    else:
+        target_body_yaw = clamp_body_yaw(final_head_yaw)
+        if manager.state.robot_state == RobotState.IDLE and not manager.state.face_detected:
+            target_body_yaw = 0.0
 
     now = manager._now()
     if manager._body_yaw_smoothed is None:

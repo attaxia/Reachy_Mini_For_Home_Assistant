@@ -233,6 +233,15 @@ class MovementManager:
         self._body_yaw_smoothed: float | None = None
         self._last_body_yaw_update = 0.0
 
+        # Optional user-commanded body yaw override (radians) coming from
+        # the HA "Body Yaw" entity / ReachyController.set_body_yaw. When
+        # set, compose_final_pose uses this value instead of the
+        # auto-derived (head-yaw-coupled) value, so the body stays where
+        # the user put it. Cleared automatically when the robot leaves
+        # IDLE (voice phases / face tracking should re-couple head and
+        # body) or when the user explicitly resets it.
+        self._user_body_yaw_override: float | None = None
+
         # Camera server reference for gesture state streaming (no face tracking)
         self._camera_server = None
 
@@ -594,6 +603,19 @@ class MovementManager:
         self._deep_sleep_state_callback = callback
         # Reset so the next loop iteration unconditionally publishes once.
         self._last_published_deep_sleep_state = None
+
+    def set_user_body_yaw(self, body_yaw_rad: float | None) -> None:
+        """Set or clear the user's manual body-yaw override (radians).
+
+        When set, compose_final_pose() uses this value as the target body
+        yaw on every control-loop iteration, so the body stays where the
+        user put it instead of being snapped back by the auto-derivation
+        (which couples body yaw to head yaw and resets to 0 when idle
+        with no face detected).
+
+        Pass `None` to release the override and return to auto mode.
+        """
+        self._user_body_yaw_override = body_yaw_rad
 
     # =========================================================================
     # DOA (Direction of Arrival) Sound Tracking API
