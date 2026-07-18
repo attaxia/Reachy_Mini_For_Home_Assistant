@@ -7,6 +7,7 @@ This module contains fundamental components:
 - Exceptions: Custom exception classes
 - SystemDiagnostics: System diagnostics utilities
 - Util: Common utility functions
+- RemoteLogging: Optional log streaming via OpenTelemetry (OTLP)
 """
 
 from .config import Config
@@ -20,6 +21,7 @@ from .exceptions import (
     RobotConnectionError,
     ServiceSuspendedError,
 )
+from .remote_logging import install_remote_logging
 from .service_base import RobustOperationMixin, ServiceManager, ServiceState, SleepAwareService
 from .system_diagnostics import get_system_diagnostics
 from .util import call_all, get_mac
@@ -44,4 +46,6 @@ __all__ = [
     "get_mac",
     # System diagnostics
     "get_system_diagnostics",
+    # Remote logging
+    "install_remote_logging",
 ]

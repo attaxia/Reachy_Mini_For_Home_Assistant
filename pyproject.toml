@@ -44,6 +44,10 @@ dependencies = [
     "pillow>=10.0,<12.0",
     "pydantic>=2.0,<=2.12.5",
     "requests>=2.33.0",
+
+    # Loads optional developer settings (e.g. remote logging) from a
+    # git-ignored .env file, instead of requiring exported shell env vars
+    "python-dotenv>=1.0,<2.0",
 ]
 keywords = ["reachy-mini-app", "reachy-mini", "home-assistant", "voice-assistant"]
 

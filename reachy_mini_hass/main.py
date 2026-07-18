@@ -158,6 +158,12 @@ if __name__ == "__main__":
     logging.getLogger("reachy_mini.media.audio_base").setLevel(logging.WARNING)
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
+    # Optional: stream logs via OpenTelemetry (OTLP) if configured via .env
+    # (no-op otherwise, see core/remote_logging.py)
+    from .core import install_remote_logging
+
+    install_remote_logging()
+
     app = ReachyMiniHaVoice()
     try:
         app.wrapped_run()

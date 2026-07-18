@@ -63,6 +63,12 @@ async def main() -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
+    # Optional: stream logs via OpenTelemetry (OTLP) if configured via .env
+    # (no-op otherwise, see core/remote_logging.py)
+    from .core import install_remote_logging
+
+    install_remote_logging()
+
     # Initialize Reachy Mini (required)
     from reachy_mini import ReachyMini
 
