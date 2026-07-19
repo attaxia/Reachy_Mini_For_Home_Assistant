@@ -67,17 +67,24 @@ def handle_command(manager: "MovementManager", cmd: str, payload: Any) -> None:
             # Preserve the current pose anchor during an active conversation.
             # This keeps wakeup turn-to-sound orientation until the session
             # actually ends and `on_idle()` decides how to settle the robot.
-            # When idle behavior is disabled, leaving IDLE also needs to clear
-            # the low-energy rest pose so listening/thinking/speaking can lift
-            # the head again while still keeping the current yaw anchor.
+            # When idle behavior is disabled, leaving IDLE also needs to lift
+            # the head out of the low-energy rest pose. The lift must be an
+            # interpolated action, not an instant target jump: the rest pose
+            # sits at the edge of the platform's reachable workspace and the
+            # daemon's IK silently rejects large direct transitions from
+            # there (same constraint as queue_emotion_move's lift_for_emotion).
+            # A pending turn_to (DOA) or lift already interpolates to a
+            # raised pose and is kept; a pending idle_rest is still lowering
+            # the head and must be replaced.
             if old_state == RobotState.IDLE and not manager._idle_behavior_enabled():
-                manager.state.target_x = 0.0
-                manager.state.target_y = 0.0
-                manager.state.target_z = 0.0
-                manager.state.target_roll = 0.0
-                manager.state.target_pitch = 0.0
-                manager.state.target_antenna_left = 0.0
-                manager.state.target_antenna_right = 0.0
+                pending = manager._pending_action
+                if pending is None or pending.name == "idle_rest":
+                    lift = PendingAction(
+                        name="lift_for_voice",
+                        target_yaw=manager.state.target_yaw,
+                        duration=0.6,
+                    )
+                    start_action(manager, lift)
             manager._idle_antenna_smoothed = None
             manager._last_idle_antenna_update = 0.0
             # Leaving IDLE means we are no longer at deep sleep — clear the

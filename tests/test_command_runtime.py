@@ -17,10 +17,11 @@ class CommandRuntimeSourceTests(unittest.TestCase):
 
         self.assertNotIn("manager.state.target_yaw = 0.0", body)
         self.assertIn("Preserve the current pose anchor", body)
-        self.assertIn("manager.state.target_pitch = 0.0", body)
-        self.assertIn("manager.state.target_roll = 0.0", body)
-        self.assertIn("manager.state.target_antenna_left = 0.0", body)
-        self.assertIn("manager.state.target_antenna_right = 0.0", body)
+        # Leaving deep-sleep rest must interpolate via a lift action, never
+        # jump targets instantly (daemon IK rejects the direct transition).
+        self.assertNotIn("manager.state.target_pitch = 0.0", body)
+        self.assertNotIn("manager.state.target_z = 0.0", body)
+        self.assertIn("lift_for_voice", body)
         self.assertIn("old_state == RobotState.IDLE and not manager._idle_behavior_enabled()", body)
 
 
@@ -84,6 +85,80 @@ class VoicePipelineStopTests(unittest.TestCase):
         self.assertEqual(len(unduck_calls), 1)
         self.assertEqual(len(stop_calls), 1)
         self.assertEqual(protocol._tts_finished_calls, 0)
+
+
+class VoiceLiftFromDeepSleepTests(unittest.TestCase):
+    def _make_manager(self, pending=None, idle_enabled=False):
+        from reachy_mini_hass.motion.state_machine import RobotState
+
+        state = types.SimpleNamespace(
+            robot_state=RobotState.IDLE,
+            last_activity_time=0.0,
+            target_pitch=0.5,
+            target_yaw=0.1,
+            target_roll=0.0,
+            target_x=0.0,
+            target_y=0.0,
+            target_z=-0.03,
+            target_antenna_left=1.0,
+            target_antenna_right=1.0,
+        )
+        return types.SimpleNamespace(
+            state=state,
+            _pending_action=pending,
+            _now=lambda: 100.0,
+            _idle_behavior_enabled=lambda: idle_enabled,
+            _animation_player=types.SimpleNamespace(set_animation=lambda name: None, stop=lambda: None),
+            _idle_antenna_smoothed=None,
+            _last_idle_antenna_update=0.0,
+            _at_deep_sleep_pose=True,
+            _user_body_yaw_override=0.3,
+            _action_start_time=0.0,
+            _action_start_pose=None,
+        )
+
+    def test_leaving_deep_sleep_idle_starts_lift_action(self):
+        from reachy_mini_hass.motion import command_runtime
+        from reachy_mini_hass.motion.state_machine import RobotState
+
+        manager = self._make_manager()
+        command_runtime.handle_command(manager, "set_state", RobotState.LISTENING)
+
+        self.assertIsNotNone(manager._pending_action)
+        self.assertEqual(manager._pending_action.name, "lift_for_voice")
+        self.assertEqual(manager._pending_action.target_yaw, 0.1)
+        self.assertEqual(manager._pending_action.target_z, 0.0)
+        self.assertFalse(manager._at_deep_sleep_pose)
+        self.assertIsNone(manager._user_body_yaw_override)
+
+    def test_pending_turn_to_action_is_not_replaced(self):
+        from reachy_mini_hass.motion import command_runtime
+        from reachy_mini_hass.motion.state_machine import PendingAction, RobotState
+
+        pending = PendingAction(name="turn_to", target_yaw=0.5, duration=0.5)
+        manager = self._make_manager(pending=pending)
+        command_runtime.handle_command(manager, "set_state", RobotState.LISTENING)
+
+        self.assertIs(manager._pending_action, pending)
+
+    def test_pending_idle_rest_action_is_replaced_by_lift(self):
+        from reachy_mini_hass.motion import command_runtime
+        from reachy_mini_hass.motion.state_machine import PendingAction, RobotState
+
+        pending = PendingAction(name="idle_rest", duration=2.0)
+        manager = self._make_manager(pending=pending)
+        command_runtime.handle_command(manager, "set_state", RobotState.LISTENING)
+
+        self.assertEqual(manager._pending_action.name, "lift_for_voice")
+
+    def test_raised_idle_mode_does_not_start_lift(self):
+        from reachy_mini_hass.motion import command_runtime
+        from reachy_mini_hass.motion.state_machine import RobotState
+
+        manager = self._make_manager(idle_enabled=True)
+        command_runtime.handle_command(manager, "set_state", RobotState.LISTENING)
+
+        self.assertIsNone(manager._pending_action)
 
 
 class PipelineWatchdogTests(unittest.TestCase):

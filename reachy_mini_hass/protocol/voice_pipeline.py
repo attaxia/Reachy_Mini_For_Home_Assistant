@@ -54,7 +54,7 @@ def _pipeline_watchdog_expired(protocol: "VoiceSatelliteProtocol") -> None:
 def handle_voice_event(
     protocol: "VoiceSatelliteProtocol", event_type: VoiceAssistantEventType, data: dict[str, str]
 ) -> None:
-    _LOGGER.debug("Voice event: type=%s, data=%s", event_type.name, data)
+    _LOGGER.info("Voice event: type=%s, data=%s", event_type.name, data)
 
     if event_type in (
         VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END,
