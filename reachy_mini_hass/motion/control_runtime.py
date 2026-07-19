@@ -22,9 +22,13 @@ logger = logging.getLogger(__name__)
 # Deadbands for skipping redundant set_target sends. A send is skipped when
 # every component moved less than its epsilon since the last successful send
 # (subject to the idle keepalive below, so the daemon still sees traffic).
-POSE_EPS = 1e-3  # Max element delta in 4x4 pose matrix
-ANTENNA_EPS = 0.005  # Radians (~0.29 deg)
-BODY_YAW_EPS = 0.005  # Radians (~0.29 deg)
+# These exist ONLY to detect a parked pose — they must sit at the numeric
+# noise floor, not at a perceptual threshold. Coarser values (the old 1e-3 /
+# 0.005) quantized slow motion into visible steps: a sway moving 0.1mm per
+# 20ms tick accumulated ~10 skipped sends and then jumped a full millimeter.
+POSE_EPS = 1e-5  # Max element delta in 4x4 pose matrix
+ANTENNA_EPS = 5e-4  # Radians (~0.03 deg)
+BODY_YAW_EPS = 5e-4  # Radians (~0.03 deg)
 
 # How long the WS must stay lost (with plain set_target retries failing)
 # before we escalate to rebuilding the WebSocket client. Transient daemon
@@ -197,13 +201,15 @@ def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, ant
     # recovers lost connections — so the cap is back at the daemon's native
     # rate. Rollback lever: REACHY_MOTION_MAX_SEND_RATE.
     #
-    # The half-tick slack keeps the real cadence at the configured rate:
-    # a strict `elapsed < interval` check on a discrete loop always rounds
-    # the wait up to the next tick (20ms becomes 30ms whenever the loop
-    # drifts a few ms), which re-introduces cadence jitter.
+    # Sends follow an absolute 20ms grid (_next_send_time advances by the
+    # interval, not from the actual send timestamp) so loop-tick scheduling
+    # noise does not accumulate into cadence drift. The half-tick slack lets
+    # a tick landing just before the deadline fire instead of pushing the
+    # send a whole tick later; the daemon sample-and-holds targets, so
+    # cadence jitter translates directly into visible velocity ripple.
     min_send_interval = 1.0 / max(1.0, float(Config.motion.max_send_rate_hz))
     tick_slack = 0.5 * manager._target_period
-    if not manager._connection_lost and (now - manager._last_send_time) < (min_send_interval - tick_slack):
+    if not manager._connection_lost and now < (manager._next_send_time - tick_slack):
         return
 
     # When the pose has not meaningfully changed, drop to a slow keepalive
@@ -231,6 +237,12 @@ def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, ant
         manager._last_sent_antennas = antennas
         manager._last_sent_body_yaw = body_yaw
         manager._last_send_time = now
+        # Advance on the fixed grid; resync when we fell behind more than
+        # one interval (loop stall, keepalive gap) instead of bursting.
+        next_send = manager._next_send_time + min_send_interval
+        if next_send <= now:
+            next_send = now + min_send_interval
+        manager._next_send_time = next_send
         if manager._connection_lost:
             logger.info("✓ Connection to robot restored")
             manager._connection_lost = False
