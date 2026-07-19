@@ -65,6 +65,27 @@ AUDIO_BLOCK_SIZE = 512  # samples at 16kHz = 32ms (lower CPU while keeping wake 
 MAX_AUDIO_BUFFER_SIZE = AUDIO_BLOCK_SIZE * 40  # Max 40 chunks (~640ms) to prevent memory leak
 
 
+def assemble_audio_chunk(buffer: "deque[np.ndarray]", size: int) -> np.ndarray:
+    """Pop exactly `size` samples off a deque of float32 blocks.
+
+    A partially consumed block is pushed back to the front so no samples
+    are lost. The caller must ensure the buffer holds at least `size`
+    samples and is responsible for its own running length counter.
+    """
+    parts: list[np.ndarray] = []
+    needed = size
+    while needed > 0:
+        block = buffer.popleft()
+        if len(block) <= needed:
+            parts.append(block)
+            needed -= len(block)
+        else:
+            parts.append(block[:needed])
+            buffer.appendleft(block[needed:])
+            needed = 0
+    return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+
 class VoiceAssistantService:
     """Voice assistant service that runs ESPHome protocol server."""
 
@@ -94,10 +115,12 @@ class VoiceAssistantService:
         self._motion = ReachyMiniMotion(reachy_mini)
         self._camera_server: MJPEGCameraServer | None = None
 
-        # Audio buffer for fixed-size chunk output
-        # Use deque with maxlen to avoid creating new arrays on every operation
-        # This prevents memory leak from repeated array creation (2-3 arrays per chunk)
-        self._audio_buffer: deque[float] = deque(maxlen=MAX_AUDIO_BUFFER_SIZE)
+        # Audio buffer for fixed-size chunk output. Holds float32 numpy
+        # blocks (not individual samples): boxing 16k samples/s into Python
+        # floats and popping them one-by-one dominated idle CPU on the Pi.
+        # _audio_buffer_len tracks the total buffered sample count.
+        self._audio_buffer: deque[np.ndarray] = deque()
+        self._audio_buffer_len = 0
 
         # Audio overflow log throttling
         self._last_audio_overflow_log = 0.0
@@ -415,7 +438,7 @@ class VoiceAssistantService:
         self._robot_services_paused.set()
         self._robot_services_resumed.clear()
         self._set_services_state(suspended=True)
-        self._audio_buffer.clear()
+        self._clear_audio_buffer()
         self._suspend_satellite()
         self._set_audio_players_suspended(True)
         self._stop_media_system()
@@ -440,7 +463,7 @@ class VoiceAssistantService:
         self._robot_services_paused.set()
         self._robot_services_resumed.clear()
         self._set_services_state(suspended=True)
-        self._audio_buffer.clear()
+        self._clear_audio_buffer()
 
         if self._camera_server is not None and self._state.camera_enabled:
             try:
@@ -788,7 +811,7 @@ class VoiceAssistantService:
                             self._robot_services_paused.set()
                             self._robot_services_resumed.clear()
                             # Clear audio buffer
-                            self._audio_buffer.clear()
+                            self._clear_audio_buffer()
                     # Wait for resume signal instead of polling
                     self._robot_services_resumed.wait(timeout=0.5)
                     continue
@@ -868,20 +891,24 @@ class VoiceAssistantService:
 
         max_polls = 20  # safety valve; appsink try_pull_sample() throttles naturally
         for _poll in range(max_polls):
-            if len(self._audio_buffer) >= AUDIO_BLOCK_SIZE:
+            if self._audio_buffer_len >= AUDIO_BLOCK_SIZE:
                 break
             audio_data = self.reachy_mini.media.get_audio_sample()
             if audio_data is None:
                 continue
             self._ingest_audio_sample(audio_data)
 
-        if len(self._audio_buffer) < AUDIO_BLOCK_SIZE:
+        if self._audio_buffer_len < AUDIO_BLOCK_SIZE:
             return None
 
-        chunk = [self._audio_buffer.popleft() for _ in range(AUDIO_BLOCK_SIZE)]
-        chunk_array = np.array(chunk, dtype=np.float32)
+        chunk_array = assemble_audio_chunk(self._audio_buffer, AUDIO_BLOCK_SIZE)
+        self._audio_buffer_len -= AUDIO_BLOCK_SIZE
         pcm_bytes = (np.clip(chunk_array, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
         return pcm_bytes
+
+    def _clear_audio_buffer(self) -> None:
+        self._audio_buffer.clear()
+        self._audio_buffer_len = 0
 
     def _ingest_audio_sample(self, audio_data) -> None:
         """Validate, convert and buffer one audio sample from the SDK.
@@ -920,7 +947,14 @@ class VoiceAssistantService:
             if audio_data.ndim != 1:
                 return
 
-            self._audio_buffer.extend(audio_data)
+            block = np.ascontiguousarray(audio_data, dtype=np.float32)
+            self._audio_buffer.append(block)
+            self._audio_buffer_len += len(block)
+            # Bound the buffer by dropping the oldest blocks (matches the old
+            # deque maxlen behavior of discarding the oldest samples).
+            while self._audio_buffer_len > MAX_AUDIO_BUFFER_SIZE and self._audio_buffer:
+                dropped = self._audio_buffer.popleft()
+                self._audio_buffer_len -= len(dropped)
         except (TypeError, ValueError):
             pass
 

@@ -35,6 +35,12 @@ WS_REBUILD_AFTER_LOST_S = 10.0
 # so a down daemon isn't hammered with back-to-back handshakes.
 WS_REBUILD_RETRY_INTERVAL_S = 10.0
 
+# Control loop tick period while parked at the deep sleep rest pose. The
+# full-rate loop (default 100Hz) exists for smooth animation; a parked robot
+# composes the same static pose thousands of times for nothing. Commands are
+# polled every tick, so waking costs at most one tick of extra latency.
+DEEP_SLEEP_CONTROL_PERIOD_S = 0.1
+
 
 def update_emotion_move(manager: "MovementManager") -> tuple[np.ndarray, tuple[float, float], float] | None:
     with manager._emotion_move_lock:
@@ -363,7 +369,10 @@ def run_control_loop(manager: "MovementManager", *, max_control_dt_s: float) -> 
             _publish_deep_sleep_state_if_changed(manager)
         except Exception as e:
             manager._log_error_throttled(f"Control loop error: {e}")
-        sleep_time = max(0.0, manager._target_period - (manager._now() - loop_start))
+        period = manager._target_period
+        if manager.is_in_deep_sleep_state():
+            period = max(period, DEEP_SLEEP_CONTROL_PERIOD_S)
+        sleep_time = max(0.0, period - (manager._now() - loop_start))
         if sleep_time > 0:
             time.sleep(sleep_time)
     logger.info("Movement manager control loop stopped")
