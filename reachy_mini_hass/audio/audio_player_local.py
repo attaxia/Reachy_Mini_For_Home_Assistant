@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from .audio_player_shared import STREAM_FETCH_CHUNK_SIZE, _LOGGER, sniff_audio_content_type
+from .audio_player_shared import STREAM_FETCH_CHUNK_SIZE, _LOGGER, sniff_audio_content_type, stop_playback_keep_mic
 
 
 class AudioPlayerLocalMixin:
@@ -104,10 +104,10 @@ class AudioPlayerLocalMixin:
                 now = time.monotonic()
                 if now > playback_timeout:
                     _LOGGER.warning("Audio playback timeout (%.1fs), stopping", max_duration)
-                    self.reachy_mini.media.stop_playing()
+                    stop_playback_keep_mic(self.reachy_mini)
                     break
                 if self._stop_flag.is_set():
-                    self.reachy_mini.media.stop_playing()
+                    stop_playback_keep_mic(self.reachy_mini)
                     break
                 if has_duration:
                     if (now - start_time) >= duration_s:

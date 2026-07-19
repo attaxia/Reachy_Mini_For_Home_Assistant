@@ -15,6 +15,25 @@ SENDSPIN_LATE_DROP_GRACE_US = 150_000
 SENDSPIN_SCHEDULE_AHEAD_LIMIT_US = 2_000_000
 
 
+def stop_playback_keep_mic(reachy_mini) -> None:
+    """Stop SDK audio playback without killing microphone capture.
+
+    SDK 1.9 uses ONE shared GStreamer pipeline ("reachymini_audio") for both
+    mic capture and playback; ``media.stop_playing()`` sets that entire
+    pipeline to NULL, silently killing the mic (no more wake words, no STT
+    audio). ``media.start_recording()`` sets the same pipeline back to
+    PLAYING, restoring capture; the playback branch stays silent until new
+    audio is pushed. Every mid-session playback stop MUST go through this
+    helper — only shutdown/suspend paths may call ``stop_playing`` directly.
+    """
+    media = reachy_mini.media
+    media.stop_playing()
+    try:
+        media.start_recording()
+    except Exception:
+        _LOGGER.warning("Failed to re-arm mic capture after stop_playing", exc_info=True)
+
+
 def sniff_audio_content_type(audio_bytes: bytes) -> str:
     if len(audio_bytes) >= 12:
         if audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE":

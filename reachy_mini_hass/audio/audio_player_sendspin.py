@@ -14,6 +14,7 @@ from .audio_player_shared import (
     SENDSPIN_LATE_DROP_GRACE_US,
     SENDSPIN_LOCAL_BUFFER_CAPACITY_BYTES,
     SENDSPIN_SCHEDULE_AHEAD_LIMIT_US,
+    stop_playback_keep_mic,
 )
 
 if TYPE_CHECKING:
@@ -166,7 +167,7 @@ class AudioPlayerSendspinMixin:
             _LOGGER.debug("Failed to clear output buffer", exc_info=True)
         if self._sendspin_playback_started:
             try:
-                self.reachy_mini.media.stop_playing()
+                stop_playback_keep_mic(self.reachy_mini)
             except Exception:
                 _LOGGER.debug("Failed to stop Sendspin playback", exc_info=True)
         self._sendspin_playback_started = False

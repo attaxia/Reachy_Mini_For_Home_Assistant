@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING
 import requests
 
 from .audio_player_local import AudioPlayerLocalMixin
-from .audio_player_shared import STREAM_FETCH_CHUNK_SIZE, _LOGGER, rewrite_local_service_url, sniff_audio_content_type
+from .audio_player_shared import (
+    STREAM_FETCH_CHUNK_SIZE,
+    _LOGGER,
+    rewrite_local_service_url,
+    sniff_audio_content_type,
+    stop_playback_keep_mic,
+)
 from .audio_player_stream_decoded import AudioPlayerStreamDecodedMixin
 from .audio_player_stream_pcm import AudioPlayerStreamPCMMixin
 
@@ -145,7 +151,7 @@ class AudioPlayerPlaybackMixin(
     def pause(self) -> None:
         self._stop_flag.set()
         try:
-            self.reachy_mini.media.stop_playing()
+            stop_playback_keep_mic(self.reachy_mini)
         except Exception:
             pass
         self.is_playing = False
@@ -158,7 +164,7 @@ class AudioPlayerPlaybackMixin(
     def stop(self) -> None:
         self._stop_flag.set()
         try:
-            self.reachy_mini.media.stop_playing()
+            stop_playback_keep_mic(self.reachy_mini)
         except Exception:
             pass
         if self._playback_thread and self._playback_thread.is_alive():
