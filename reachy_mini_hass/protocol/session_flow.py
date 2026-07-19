@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from aioesphomeapi.api_pb2 import VoiceAssistantAnnounceFinished, VoiceAssistantRequest  # type: ignore[attr-defined]
 
 from ..core.config import Config
+from .voice_pipeline import arm_pipeline_watchdog
 
 if TYPE_CHECKING:
     from .satellite import VoiceSatelliteProtocol
@@ -55,6 +56,8 @@ def on_wakeup_sound_finished(protocol: "VoiceSatelliteProtocol") -> None:
 
     protocol.send_messages([request])
     protocol._is_streaming_audio = True
+    logger.info("Voice pipeline requested (wake_word=%s), awaiting run start", wake_word_phrase or "none")
+    arm_pipeline_watchdog(protocol, Config.voice.pipeline_start_timeout)
 
 
 def play_wakeup_sound(protocol: "VoiceSatelliteProtocol") -> None:

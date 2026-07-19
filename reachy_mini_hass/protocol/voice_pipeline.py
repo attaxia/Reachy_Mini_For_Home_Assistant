@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 
 from aioesphomeapi.model import VoiceAssistantEventType, VoiceAssistantTimerEventType
 
+from ..core.config import Config
+
 if TYPE_CHECKING:
     from aioesphomeapi.api_pb2 import VoiceAssistantTimerEventResponse  # type: ignore[attr-defined]
     from .satellite import VoiceSatelliteProtocol
@@ -18,12 +20,54 @@ _LOGGER = logging.getLogger(__name__)
 _THINKING_SOUND = Path(__file__).resolve().parent.parent / "sounds" / "processing.wav"
 
 
+def arm_pipeline_watchdog(protocol: "VoiceSatelliteProtocol", timeout_s: float) -> None:
+    """(Re)start the timer that abandons the pipeline if HA stops responding."""
+    cancel_pipeline_watchdog(protocol)
+    timer = threading.Timer(timeout_s, _pipeline_watchdog_expired, args=[protocol])
+    timer.daemon = True
+    protocol._pipeline_watchdog_timer = timer
+    timer.start()
+
+
+def cancel_pipeline_watchdog(protocol: "VoiceSatelliteProtocol") -> None:
+    if protocol._pipeline_watchdog_timer is not None:
+        protocol._pipeline_watchdog_timer.cancel()
+        protocol._pipeline_watchdog_timer = None
+
+
+def _pipeline_watchdog_expired(protocol: "VoiceSatelliteProtocol") -> None:
+    protocol._pipeline_watchdog_timer = None
+    if not protocol._pipeline_active:
+        return
+    _LOGGER.warning(
+        "Voice pipeline watchdog expired: no event from Home Assistant, abandoning pipeline and returning to idle"
+    )
+    protocol._pipeline_active = False
+    protocol._is_streaming_audio = False
+    protocol._pending_voice_request = None
+    protocol._tts_played = False
+    protocol._continue_conversation = False
+    protocol.unduck()
+    protocol._reachy_on_idle()
+
+
 def handle_voice_event(
     protocol: "VoiceSatelliteProtocol", event_type: VoiceAssistantEventType, data: dict[str, str]
 ) -> None:
     _LOGGER.debug("Voice event: type=%s, data=%s", event_type.name, data)
 
+    if event_type in (
+        VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END,
+        VoiceAssistantEventType.VOICE_ASSISTANT_ERROR,
+    ):
+        # Pipeline is over; TTS playback has its own duration watchdog and
+        # tts_finished() resets the remaining state.
+        cancel_pipeline_watchdog(protocol)
+    else:
+        arm_pipeline_watchdog(protocol, Config.voice.pipeline_event_timeout)
+
     if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
+        _LOGGER.info("Voice pipeline run started")
         protocol._pipeline_active = True
         protocol._tts_url = data.get("url")
         protocol._tts_played = False
@@ -101,6 +145,7 @@ def handle_timer_event(
 
 
 def stop(protocol: "VoiceSatelliteProtocol") -> None:
+    cancel_pipeline_watchdog(protocol)
     protocol._pipeline_active = False
     protocol._is_streaming_audio = False
     protocol._continue_conversation = False

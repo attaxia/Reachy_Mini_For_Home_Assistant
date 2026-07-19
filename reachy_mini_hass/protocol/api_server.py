@@ -17,6 +17,7 @@ from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     HelloResponse,
     PingRequest,
     PingResponse,
+    VoiceAssistantAudio,
 )
 from aioesphomeapi.core import MESSAGE_TYPE_TO_PROTO
 from google.protobuf import message
@@ -36,6 +37,7 @@ class APIServer(asyncio.Protocol):
         self._pos: int = 0
         self._transport = None
         self._writelines = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     @abstractmethod
     def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
@@ -89,7 +91,33 @@ class APIServer(asyncio.Protocol):
                 self._writelines = None
 
     def send_messages(self, msgs: list[message.Message]):
+        # asyncio transports are not thread-safe: writes from worker threads
+        # (audio processing, TTS playback callbacks) must be marshalled onto
+        # the event loop or they can race with loop-thread writes and corrupt
+        # the frame stream.
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is not loop:
+                try:
+                    loop.call_soon_threadsafe(self._write_messages, msgs)
+                except RuntimeError:
+                    # Loop closed during shutdown
+                    pass
+                return
+        self._write_messages(msgs)
+
+    def _write_messages(self, msgs: list[message.Message]):
         if self._writelines is None:
+            # Dropped mic audio after disconnect is routine; anything else is
+            # a lost protocol message worth surfacing.
+            if msgs and not isinstance(msgs[0], VoiceAssistantAudio):
+                _LOGGER.warning(
+                    "Cannot send %s: transport not available", msgs[0].__class__.__name__
+                )
             return
 
         try:
@@ -111,6 +139,7 @@ class APIServer(asyncio.Protocol):
     def connection_made(self, transport) -> None:
         self._transport = transport
         self._writelines = transport.writelines
+        self._loop = asyncio.get_running_loop()
         _LOGGER.info("ESPHome client connected from %s", transport.get_extra_info("peername"))
 
     def data_received(self, data: bytes):

@@ -39,6 +39,7 @@ class VoicePipelineStopTests(unittest.TestCase):
             _timer_ring_start=123.0,
             _tts_url="http://example.test/tts",
             _tts_played=False,
+            _pipeline_watchdog_timer=None,
             state=state,
         )
         protocol._set_stop_word_active_calls = []
@@ -83,6 +84,82 @@ class VoicePipelineStopTests(unittest.TestCase):
         self.assertEqual(len(unduck_calls), 1)
         self.assertEqual(len(stop_calls), 1)
         self.assertEqual(protocol._tts_finished_calls, 0)
+
+
+class PipelineWatchdogTests(unittest.TestCase):
+    def _make_protocol(self):
+        protocol = types.SimpleNamespace(
+            _pipeline_active=True,
+            _is_streaming_audio=True,
+            _continue_conversation=True,
+            _pending_voice_request=("wake", "conv"),
+            _tts_played=True,
+            _pipeline_watchdog_timer=None,
+        )
+        protocol._unduck_calls = 0
+        protocol._idle_calls = 0
+        protocol.unduck = lambda: setattr(protocol, "_unduck_calls", protocol._unduck_calls + 1)
+        protocol._reachy_on_idle = lambda: setattr(protocol, "_idle_calls", protocol._idle_calls + 1)
+        return protocol
+
+    def test_expiry_abandons_active_pipeline(self):
+        protocol = self._make_protocol()
+
+        voice_pipeline._pipeline_watchdog_expired(protocol)
+
+        self.assertFalse(protocol._pipeline_active)
+        self.assertFalse(protocol._is_streaming_audio)
+        self.assertFalse(protocol._continue_conversation)
+        self.assertFalse(protocol._tts_played)
+        self.assertIsNone(protocol._pending_voice_request)
+        self.assertEqual(protocol._unduck_calls, 1)
+        self.assertEqual(protocol._idle_calls, 1)
+
+    def test_expiry_is_noop_when_pipeline_inactive(self):
+        protocol = self._make_protocol()
+        protocol._pipeline_active = False
+
+        voice_pipeline._pipeline_watchdog_expired(protocol)
+
+        self.assertEqual(protocol._unduck_calls, 0)
+        self.assertEqual(protocol._idle_calls, 0)
+
+    def test_arm_and_cancel_manage_timer(self):
+        protocol = self._make_protocol()
+
+        voice_pipeline.arm_pipeline_watchdog(protocol, 60.0)
+        first_timer = protocol._pipeline_watchdog_timer
+        self.assertIsNotNone(first_timer)
+
+        voice_pipeline.arm_pipeline_watchdog(protocol, 60.0)
+        self.assertIsNot(protocol._pipeline_watchdog_timer, first_timer)
+
+        voice_pipeline.cancel_pipeline_watchdog(protocol)
+        self.assertIsNone(protocol._pipeline_watchdog_timer)
+
+    def test_run_end_event_cancels_watchdog(self):
+        from aioesphomeapi.model import VoiceAssistantEventType
+
+        protocol = self._make_protocol()
+        voice_pipeline.arm_pipeline_watchdog(protocol, 60.0)
+
+        voice_pipeline.handle_voice_event(
+            protocol, VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END, {}
+        )
+
+        self.assertIsNone(protocol._pipeline_watchdog_timer)
+
+    def test_non_terminal_event_rearms_watchdog(self):
+        from aioesphomeapi.model import VoiceAssistantEventType
+
+        protocol = self._make_protocol()
+        self.addCleanup(lambda: voice_pipeline.cancel_pipeline_watchdog(protocol))
+
+        voice_pipeline.handle_voice_event(
+            protocol, VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_START, {}
+        )
+
+        self.assertIsNotNone(protocol._pipeline_watchdog_timer)
 
 
 class CommandRuntimeStateQueueTests(unittest.TestCase):

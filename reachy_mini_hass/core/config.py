@@ -84,6 +84,14 @@ class VoiceConfig:
     # assistant's own TTS playback and self-triggering wake word detection.
     continue_conversation_settle_delay: float = 0.5  # seconds
 
+    # Watchdog: max wait between sending VoiceAssistantRequest and the first
+    # pipeline event from Home Assistant before abandoning the pipeline.
+    pipeline_start_timeout: float = 30.0  # seconds
+
+    # Watchdog: max wait between subsequent pipeline events (covers the STT
+    # listening phase, so must exceed Home Assistant's own VAD timeout).
+    pipeline_event_timeout: float = 60.0  # seconds
+
 
 @dataclass
 class CameraConfig:
@@ -281,6 +289,12 @@ class Config:
         cls.voice.continue_conversation_settle_delay = _env_float(
             "REACHY_VOICE_CONTINUE_CONVERSATION_SETTLE_DELAY", cls.voice.continue_conversation_settle_delay
         )
+        cls.voice.pipeline_start_timeout = _env_float(
+            "REACHY_VOICE_PIPELINE_START_TIMEOUT", cls.voice.pipeline_start_timeout
+        )
+        cls.voice.pipeline_event_timeout = _env_float(
+            "REACHY_VOICE_PIPELINE_EVENT_TIMEOUT", cls.voice.pipeline_event_timeout
+        )
 
         # Camera
         cls.camera.port = _env_int("REACHY_CAMERA_PORT", cls.camera.port)
@@ -406,6 +420,8 @@ class Config:
             },
             "voice": {
                 "continue_conversation_settle_delay": cls.voice.continue_conversation_settle_delay,
+                "pipeline_start_timeout": cls.voice.pipeline_start_timeout,
+                "pipeline_event_timeout": cls.voice.pipeline_event_timeout,
             },
             "camera": {
                 "port": cls.camera.port,

@@ -58,6 +58,7 @@ from .session_flow import (
     tts_finished,
 )
 from .voice_pipeline import (
+    cancel_pipeline_watchdog,
     duck,
     handle_timer_event,
     handle_voice_event,
@@ -115,6 +116,7 @@ class VoiceSatelliteProtocol(APIServer):
         self._ha_entity_states: dict[str, str] = {}
         self._idle_return_timer: threading.Timer | None = None
         self._continue_conversation_timer: threading.Timer | None = None
+        self._pipeline_watchdog_timer: threading.Timer | None = None
         self._pipeline_active = False
 
         # Initialize Reachy controller
@@ -295,7 +297,7 @@ class VoiceSatelliteProtocol(APIServer):
             return
 
         if self._pipeline_active:
-            _LOGGER.debug("Ignoring wake word - pipeline already active")
+            _LOGGER.info("Ignoring wake word - pipeline already active")
             return
 
         wake_word_phrase = wake_word.wake_word
@@ -369,6 +371,7 @@ class VoiceSatelliteProtocol(APIServer):
         super().connection_lost(exc)
         _LOGGER.info("Disconnected from Home Assistant")
         self._cancel_delayed_idle_return()
+        cancel_pipeline_watchdog(self)
         # Stop the face-target status sampler
         self._face_target_stop.set()
         # Clear streaming state on disconnect
@@ -438,6 +441,7 @@ class VoiceSatelliteProtocol(APIServer):
         """
         _LOGGER.info("Suspending VoiceSatellite resources...")
         self._cancel_delayed_idle_return()
+        cancel_pipeline_watchdog(self)
         self._pipeline_active = False
         self._pending_voice_request = None
         self._timer_finished = False
