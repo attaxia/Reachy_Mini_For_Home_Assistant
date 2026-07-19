@@ -185,16 +185,25 @@ def issue_control_command(manager: "MovementManager", head_pose: np.ndarray, ant
         return
     now = manager._now()
 
-    # Cap actual WS sends to Config.motion.max_send_rate_hz (default 15Hz).
-    # The control loop itself runs at 100Hz to keep animation and pose
-    # composition fresh, but ~15Hz is enough to drive the motors smoothly.
-    # Sending at the full loop rate has been observed (see ae13179's log
-    # capture) to starve the daemon's outbound publishes under combined
-    # audio + motion load; the SDK's WSClient then misses its 1s heartbeat
-    # window, flips `_is_alive` to False, and every subsequent set_target
-    # raises "Lost connection" — motion freezes while audio keeps working.
+    # Cap actual WS sends to Config.motion.max_send_rate_hz (default 50Hz,
+    # matching the daemon's 50Hz hardware loop — it sample-and-holds targets
+    # without interpolation, so a fresh target per hardware tick is what
+    # makes motion look continuous). The control loop runs at 100Hz to keep
+    # animation and pose composition fresh; only WS traffic is capped.
+    # History: uncapped 100Hz sends coincided with WS heartbeat loss under
+    # combined audio+motion load (ae13179) and a 15Hz cap was the workaround.
+    # The starvation mechanism was never confirmed daemon-side, the audio
+    # path has since shed most of its CPU cost, and a real WS rebuild now
+    # recovers lost connections — so the cap is back at the daemon's native
+    # rate. Rollback lever: REACHY_MOTION_MAX_SEND_RATE.
+    #
+    # The half-tick slack keeps the real cadence at the configured rate:
+    # a strict `elapsed < interval` check on a discrete loop always rounds
+    # the wait up to the next tick (20ms becomes 30ms whenever the loop
+    # drifts a few ms), which re-introduces cadence jitter.
     min_send_interval = 1.0 / max(1.0, float(Config.motion.max_send_rate_hz))
-    if not manager._connection_lost and (now - manager._last_send_time) < min_send_interval:
+    tick_slack = 0.5 * manager._target_period
+    if not manager._connection_lost and (now - manager._last_send_time) < (min_send_interval - tick_slack):
         return
 
     # When the pose has not meaningfully changed, drop to a slow keepalive

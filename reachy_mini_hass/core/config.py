@@ -117,7 +117,14 @@ class MotionConfig:
     # Control loop
     control_rate_hz: float = 100.0
     control_interval: float = 0.01  # 1 / control_rate_hz
-    max_send_rate_hz: float = 15.0  # Hard cap for set_target send rate
+    # Hard cap for set_target send rate. 50Hz matches the daemon's hardware
+    # control loop (robot/backend.py control_loop_frequency), so every
+    # hardware tick gets a fresh target — the daemon does NOT interpolate
+    # between targets, it sample-and-holds, so lower rates stair-step the
+    # motion (~70ms holds at the old 15Hz cap). If WS heartbeat loss under
+    # combined audio+motion load ever resurfaces (unconfirmed theory from
+    # ae13179), lower via REACHY_MOTION_MAX_SEND_RATE instead of editing this.
+    max_send_rate_hz: float = 50.0
     idle_heartbeat_interval_s: float = 1.0  # Keepalive interval when pose unchanged
 
     # Face tracking
